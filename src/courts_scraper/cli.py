@@ -26,7 +26,7 @@ from rich.table import Table
 from courts_scraper import __version__, prompts
 from courts_scraper.corpus import build_corpus
 from courts_scraper.db import Repository
-from courts_scraper.export import ExportError, export_run
+from courts_scraper.export import ExportError, data_dictionary_markdown, export_run
 from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
 from courts_scraper.query import Court
@@ -375,6 +375,23 @@ def export_cmd(
     )
     for path in result.files:
         console.print(f"  {path.name}")
+
+
+@app.command("data-dictionary")
+def data_dictionary_cmd(
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Write to this file instead of stdout."),
+    ] = None,
+) -> None:
+    """Print (or write) the export data dictionary, generated from the schema."""
+    markdown = data_dictionary_markdown()
+    if out is not None:
+        out.write_text(markdown, encoding="utf-8")
+        console.print(f"Wrote data dictionary to [bold]{out}[/].")
+    else:
+        # Plain stdout so it can be piped to a file; bypass Rich markup.
+        print(markdown, end="")
 
 
 @app.command("corpus")

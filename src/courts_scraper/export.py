@@ -184,6 +184,30 @@ class ExportResult:
     record_count: int
 
 
+def data_dictionary_markdown() -> str:
+    """Render :data:`EXPORT_FIELDS` as a human-readable data dictionary.
+
+    The Table Schema and this document share one source, so they can never
+    disagree. Written into every export/corpus bundle and mirrored (generated) at
+    ``docs/DATA_DICTIONARY.md`` in the repo.
+    """
+    lines = [
+        "# Data dictionary",
+        "",
+        "Generated from the export Table Schema (`EXPORT_FIELDS`). Do not edit by "
+        "hand; regenerate with `courts-scraper data-dictionary`.",
+        "",
+        "Primary key: `document_uuid`. Missing values are the empty string.",
+        "",
+        "| Column | Type | Format | Description |",
+        "|--------|------|--------|-------------|",
+    ]
+    for f in EXPORT_FIELDS:
+        desc = f.description.replace("|", "\\|")
+        lines.append(f"| `{f.name}` | {f.type} | {f.format or ''} | {desc} |")
+    return "\n".join(lines) + "\n"
+
+
 def _flat_row(raw: RowLike, derived: Derived) -> dict[str, object]:
     """Build the flat (tabular) row: passthrough columns + derived columns.
 
@@ -425,6 +449,10 @@ def write_package(
         encoding="utf-8",
     )
     written.append(descriptor)
+
+    dictionary = out_dir / "DATA_DICTIONARY.md"
+    dictionary.write_text(data_dictionary_markdown(), encoding="utf-8")
+    written.append(dictionary)
 
     return ExportResult(files=tuple(written), record_count=len(flat))
 

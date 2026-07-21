@@ -33,6 +33,9 @@ dev = [
     "types-beautifulsoup4",
     "commitizen>=3.29",
     "pre-commit>=3.8",
+    # Validates the hand-rolled datapackage.json against the Data Package spec in
+    # CI (see tests/test_docs.py). Dev-only; not a runtime dependency.
+    "frictionless>=5",
 ]
 
 [build-system]

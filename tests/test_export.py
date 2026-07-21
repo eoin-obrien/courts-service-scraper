@@ -92,7 +92,12 @@ def test_export_writes_all_files(run_dir, tmp_path):
 
     assert result.record_count == 2
     names = {p.name for p in result.files}
-    assert names == {"judgments.csv", "judgments.json", "datapackage.json"}
+    assert names == {
+        "judgments.csv",
+        "judgments.json",
+        "datapackage.json",
+        "DATA_DICTIONARY.md",
+    }
     for name in names:
         assert (out / name).exists()
 

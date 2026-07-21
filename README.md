@@ -65,6 +65,15 @@ uv run courts-scraper run --court supreme
 
 # Check progress at any time
 uv run courts-scraper status              # also picks a run if not given
+
+# Export one run to a Frictionless Data Package (CSV + JSON + optional Parquet)
+uv run courts-scraper export --latest --format csv,json,parquet
+
+# Merge every run into one citable, fixity-checked corpus bundle (BagIt)
+uv run courts-scraper corpus --out data/corpus
+
+# Print the column data dictionary (generated from the schema)
+uv run courts-scraper data-dictionary
 ```
 
 Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
@@ -128,6 +137,36 @@ data/
     logs/
       errors.log         # durable log of skipped/failed items for follow-up
 ```
+
+Each record also carries per-phase provenance: when the search row was seen
+(`listed_at`), when the view page was scraped (`meta_retrieved_at`), and when the
+PDF was fetched and verified (`pdf_retrieved_at`), plus the PDF response's
+`Last-Modified`/`ETag`/`Content-Type` headers. The database schema migrates on
+open, so runs made by an older version keep working without a re-scrape.
+
+## Research dataset outputs
+
+The raw SQLite is captured truth. Two commands turn it into standards-based
+research data; all derived fields (ECLI later, controlled-vocabulary checks,
+authoring-judge vs full-panel) are computed at export time, so a fix is a
+re-export, never a re-scrape.
+
+- **`export`** writes a [Frictionless Data Package](https://datapackage.org):
+  `judgments.csv`, `judgments.json` (with nested metadata and the full panel),
+  optional `judgments.parquet`, a `datapackage.json` Table Schema, and a
+  `DATA_DICTIONARY.md`. The primary key is `document_uuid`; neutral citation is
+  emitted but is case-level and repeats across a case's opinions, so it is not a
+  row key. The column dictionary lives at [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md).
+- **`corpus`** merges every run into one publishable [BagIt](https://datatracker.ietf.org/doc/html/rfc8493)
+  bundle: deduplicated by `document_uuid` (latest fetch wins), with a fresh
+  `manifest-sha256.txt` over the whole payload. If the same document was ever
+  served with a different checksum across runs, that mutation is reported in
+  `snapshot.json`, never silently dropped. The bag also carries a schema.org
+  `dataset.jsonld` (for [Google Dataset Search](https://datasetsearch.research.google.com/)),
+  a `DATASHEET.md`, and a frozen `snapshot.json` stamping the schema/derive
+  versions and source-run set, so a Zenodo DOI pins one immutable snapshot.
+
+Parquet needs the optional extra: `uv sync --extra parquet`.
 
 ## Development
 
