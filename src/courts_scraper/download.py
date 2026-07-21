@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -98,10 +99,57 @@ def sweep_partials(directory: Path) -> int:
     if not directory.exists():
         return 0
     removed = 0
-    for part in directory.glob(f"*{_PART_SUFFIX}"):
+    # ``rglob`` so the sweep also reclaims scratch/archive temp files orphaned
+    # under ``versions/`` by an interrupted revalidation, not just top-level ones.
+    for part in directory.rglob(f"*{_PART_SUFFIX}"):
         part.unlink(missing_ok=True)
         removed += 1
     return removed
+
+
+def publish_scratch(scratch: Path, target: Path) -> None:
+    """Atomically publish already-verified ``scratch`` bytes as ``target``.
+
+    Used by revalidation once it has decided a re-fetched copy should replace the
+    live file. ``Path.replace`` is an atomic ``os.replace``; the directory fsync
+    makes the rename itself durable, matching the normal download publish path.
+    """
+    scratch.replace(target)
+    _fsync_dir(target.parent)
+
+
+def archive_superseded(live: Path, archive: Path) -> bool:
+    """Preserve ``live``'s bytes at content-addressed ``archive``, atomically.
+
+    Called by revalidation just before a changed document's live file is
+    overwritten, so the previous verified version is never lost. ``archive`` is
+    named by the *old* bytes' sha256, which makes this idempotent and crash-safe:
+
+    * if ``archive`` already exists, its bytes are (by content-addressing) exactly
+      the ones we would copy, so we skip -- this is also what makes a re-run after a
+      crash between publish and DB-commit correct (it never copies the *new* live
+      bytes into an *old*-digest name);
+    * otherwise copy via a ``.part`` temp + atomic ``replace`` so a crash mid-copy
+      leaves only a sweepable orphan, never a corrupt archive under a digest name.
+
+    Returns True if bytes were newly archived, False if skipped (already present or
+    the live file is missing).
+    """
+    if archive.exists():
+        return False
+    if not live.exists():
+        return False
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp = archive.with_name(archive.name + _PART_SUFFIX)
+    shutil.copy2(live, tmp)
+    # fsync the copied bytes before the rename so a power loss cannot leave a
+    # torn/zero-length file under a content-addressed (digest) name that later
+    # runs would trust forever via the exists() guard above.
+    with tmp.open("rb") as handle:
+        os.fsync(handle.fileno())
+    tmp.replace(archive)
+    _fsync_dir(archive.parent)
+    return True
 
 
 def sha256_of(path: Path) -> str:
@@ -153,11 +201,72 @@ def download_pdf(
     return _attempt()
 
 
+def download_to_scratch(
+    fetcher: Fetcher,
+    url: str,
+    scratch: Path,
+    *,
+    cancel: CancelToken,
+    max_attempts: int = 4,
+) -> DownloadResult:
+    """Download ``url`` to ``scratch``, verified, WITHOUT publishing a final name.
+
+    Revalidation needs a fresh copy to hash and compare against the stored digest
+    *before* deciding whether to overwrite the archived version, so it can never
+    destroy the previous bytes on an unchanged (or torn) re-fetch. On success the
+    verified bytes are left at ``scratch`` for the caller to publish or discard; on
+    any failure ``scratch`` is removed and the exception re-raised.
+
+    Args:
+        fetcher: The rate-limited HTTP facade.
+        url: The PDF URL to re-fetch.
+        scratch: Destination for the verified bytes. Name it with a ``.part``
+            suffix (see :func:`sweep_partials`) so a crash leaves a sweepable
+            orphan, and place it on the same filesystem as the eventual target so
+            the caller's ``os.replace`` publish is atomic.
+        cancel: Cancellation token, polled between chunks.
+        max_attempts: Attempts before a transient failure is re-raised.
+
+    Returns:
+        The verified :class:`DownloadResult` for the freshly-fetched bytes.
+    """
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+
+    @retry(
+        retry=retry_if_exception(is_retryable),
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential_jitter(initial=1.0, max=30.0),
+        reraise=True,
+    )
+    def _attempt() -> DownloadResult:
+        return _stream_to_part(fetcher, url, scratch, cancel)
+
+    return _attempt()
+
+
 def _download_once(
     fetcher: Fetcher, url: str, target: Path, cancel: CancelToken
 ) -> DownloadResult:
     """Perform a single download attempt (may be retried by the caller)."""
     part = target.with_name(target.name + _PART_SUFFIX)
+    result = _stream_to_part(fetcher, url, part, cancel)
+    # Atomic publish: the final name appears only now, fully written.
+    # ``Path.replace`` performs an atomic ``os.replace`` under the hood; we then
+    # fsync the directory so the rename itself is durable, not just the bytes.
+    part.replace(target)
+    _fsync_dir(target.parent)
+    return result
+
+
+def _stream_to_part(
+    fetcher: Fetcher, url: str, part: Path, cancel: CancelToken
+) -> DownloadResult:
+    """Stream ``url`` into ``part``, verify it, and fsync -- but do not publish.
+
+    On any failure (transient error, cancellation, incomplete body) ``part`` is
+    removed and the exception re-raised, so a caller never sees a half-written
+    scratch file. The verified bytes remain at ``part`` on success.
+    """
     digest = hashlib.sha256()
     size = 0
     header = b""
@@ -180,16 +289,9 @@ def _download_once(
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
-        # Any failure -- transient error, cancellation, incomplete body --
-        # leaves no ``.part`` behind and therefore no final file.
         part.unlink(missing_ok=True)
         raise
 
-    # Atomic publish: the final name appears only now, fully written.
-    # ``Path.replace`` performs an atomic ``os.replace`` under the hood; we then
-    # fsync the directory so the rename itself is durable, not just the bytes.
-    part.replace(target)
-    _fsync_dir(target.parent)
     return DownloadResult(sha256=digest.hexdigest(), size=size, **provenance)
 
 

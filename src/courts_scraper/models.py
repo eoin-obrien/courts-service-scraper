@@ -107,8 +107,19 @@ class RunConfig:
 
     @property
     def pdf_dir(self) -> Path:
-        """Directory that holds downloaded PDFs."""
+        """Directory that holds downloaded PDFs (the latest version of each)."""
         return self.run_dir / "pdfs"
+
+    @property
+    def versions_dir(self) -> Path:
+        """Directory that archives superseded PDF versions, content-addressed.
+
+        A revalidation that finds a document changed moves the previous bytes to
+        ``pdfs/versions/<old-sha256>.pdf`` before publishing the new bytes under
+        the live filename, so no verified version is ever overwritten. Naming by
+        digest makes the archive idempotent and self-describing.
+        """
+        return self.pdf_dir / "versions"
 
     @property
     def log_dir(self) -> Path:

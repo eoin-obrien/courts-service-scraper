@@ -34,8 +34,9 @@ DL_DONE = "done"
 DL_ERROR = "error"
 
 # Schema version, stamped in the DB via ``PRAGMA user_version``. Bump whenever a
-# column is added below so a reader can tell a migrated DB from a fresh one.
-SCHEMA_VERSION = 2
+# column or table is added below so a reader can tell a migrated DB from a fresh one.
+# v3 adds the append-only ``pdf_version`` history table and ``last_revalidated_at``.
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS record (
@@ -66,6 +67,32 @@ CREATE TABLE IF NOT EXISTS record (
 CREATE INDEX IF NOT EXISTS idx_meta_status     ON record(meta_status);
 CREATE INDEX IF NOT EXISTS idx_download_status ON record(download_status);
 CREATE INDEX IF NOT EXISTS idx_collection      ON record(collection_uuid);
+
+-- Append-only per-document PDF version history. One row per distinct set of
+-- bytes ever served for a record; ``superseded_at IS NULL`` marks the current
+-- version. Populated by ``update --revalidate``: the row that exists here for a
+-- ``done`` record preserves the audit trail (and, via ``filename``, where the
+-- archived bytes live) that in-place mutation would otherwise erase. Kept in the
+-- DB (not a sidecar log) so it exports and rides BagIt fixity like every column.
+CREATE TABLE IF NOT EXISTS pdf_version (
+    id                  INTEGER PRIMARY KEY,
+    record_id           INTEGER NOT NULL,
+    document_uuid       TEXT    NOT NULL DEFAULT '',
+    pdf_url             TEXT    NOT NULL,
+    neutral_citation    TEXT,
+    filename            TEXT,
+    sha256              TEXT    NOT NULL,
+    bytes               INTEGER NOT NULL,
+    fetched_at          TEXT    NOT NULL,
+    superseded_at       TEXT,
+    http_last_modified  TEXT,
+    http_etag           TEXT,
+    http_content_length INTEGER,
+    http_content_type   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pdf_version_record ON pdf_version(record_id);
+CREATE INDEX IF NOT EXISTS idx_pdf_version_current
+    ON pdf_version(record_id, superseded_at);
 """
 
 # Columns added after the v1 schema above. They live ONLY here -- not in the
@@ -83,6 +110,12 @@ _ADDED_COLUMNS: dict[str, str] = {
     "http_etag": "TEXT",
     "http_content_length": "INTEGER",
     "http_content_type": "TEXT",
+    # Last time ``update --revalidate`` re-checked this row's bytes (independent of
+    # ``pdf_retrieved_at``, which only moves when the bytes actually change). Drives
+    # ``ORDER BY last_revalidated_at NULLS FIRST`` so revalidate is resumable after
+    # an outage/cancel and ``--limit`` rotates through the corpus instead of always
+    # re-checking the oldest N.
+    "last_revalidated_at": "TEXT",
 }
 
 
@@ -142,6 +175,31 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def read_pdf_versions(db_path: Path) -> list[sqlite3.Row]:
+    """Read a run's full ``pdf_version`` history read-only, for the corpus snapshot.
+
+    Returns an empty list when the run predates the history table (older schema),
+    so the corpus reader can treat "no history" and "no changes" uniformly without
+    migrating the archived run. Rows are ordered oldest-first per record.
+    """
+    conn = open_readonly(db_path)
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdf_version'"
+        ).fetchone()
+        if not has_table:
+            return []
+        return conn.execute(
+            "SELECT * FROM pdf_version ORDER BY record_id, fetched_at, id"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        # A corrupt/locked run DB must not abort a whole corpus build over the
+        # optional revision history; treat it as "no history" (the missing-DB case).
+        return []
+    finally:
+        conn.close()
+
+
 class Repository:
     """Thin data-access layer over the run's SQLite database.
 
@@ -154,6 +212,10 @@ class Repository:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Wait briefly rather than failing instantly if another process holds the
+        # write lock (e.g. an overlapping run); the run-level file lock is the
+        # primary guard, this is a cheap second line against a transient clash.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -322,6 +384,200 @@ class Repository:
             (DL_ERROR, reason, record_id),
         )
         self._conn.commit()
+
+    # -- revalidation: per-document version history -----------------------
+    def backfill_pdf_versions(self) -> int:
+        """Seed a *current* ``pdf_version`` row for every ``done`` record missing one.
+
+        Runs are created before the history table existed and downloads never
+        wrote to it, so the first revalidation must record each document's
+        already-fetched bytes as its version 1 (``filename`` = the live PDF name).
+        Idempotent: a record that already has any version row is left untouched, so
+        repeated calls (every revalidate) add nothing. Returns rows inserted.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT r.* FROM record r
+            WHERE r.download_status = ? AND r.sha256 IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pdf_version v WHERE v.record_id = r.id
+              )
+            """,
+            (DL_DONE,),
+        ).fetchall()
+        for r in rows:
+            self._insert_version(
+                record_id=r["id"],
+                row=r,
+                filename=r["filename"],
+                sha256=str(r["sha256"]),
+                size=int(r["bytes"] or 0),
+                fetched_at=str(r["pdf_retrieved_at"] or _utcnow_iso()),
+                last_modified=r["http_last_modified"],
+                etag=r["http_etag"],
+                content_length=r["http_content_length"],
+                content_type=r["http_content_type"],
+            )
+        self._conn.commit()
+        return len(rows)
+
+    def iter_revalidation_targets(
+        self, *, fetched_before: str | None = None
+    ) -> Iterator[sqlite3.Row]:
+        """Yield fully-downloaded records to re-check, least-recently-checked first.
+
+        Ordering by ``last_revalidated_at`` (NULLs, i.e. never-checked, first) makes
+        a ``--limit`` sweep rotate across the corpus and lets a run resume roughly
+        where an outage/cancel stopped, rather than always re-checking the oldest ids.
+        ``sha256 IS NOT NULL`` is required so the stored digest we compare against
+        (and archive the old bytes under) is always real -- matching what
+        :meth:`backfill_pdf_versions` seeds. ``fetched_before`` excludes rows fetched
+        at/after that time, so a combined ``update --revalidate`` does not immediately
+        re-download the judgments it just fetched in the same run.
+        """
+        if fetched_before is None:
+            yield from self._conn.execute(
+                """
+                SELECT * FROM record
+                WHERE meta_status = ? AND download_status = ? AND sha256 IS NOT NULL
+                ORDER BY (last_revalidated_at IS NOT NULL), last_revalidated_at, id
+                """,
+                (META_OK, DL_DONE),
+            )
+        else:
+            yield from self._conn.execute(
+                """
+                SELECT * FROM record
+                WHERE meta_status = ? AND download_status = ? AND sha256 IS NOT NULL
+                  AND (pdf_retrieved_at IS NULL OR pdf_retrieved_at < ?)
+                ORDER BY (last_revalidated_at IS NOT NULL), last_revalidated_at, id
+                """,
+                (META_OK, DL_DONE, fetched_before),
+            )
+
+    def mark_revalidated(self, record_id: int) -> None:
+        """Stamp a record as re-checked now without changing its bytes (unchanged)."""
+        self._conn.execute(
+            "UPDATE record SET last_revalidated_at = ? WHERE id = ?",
+            (_utcnow_iso(), record_id),
+        )
+        self._conn.commit()
+
+    def record_new_version(
+        self,
+        record_id: int,
+        sha256: str,
+        size: int,
+        *,
+        archived_filename: str,
+        old_sha256: str,
+        old_bytes: int,
+        last_modified: str | None = None,
+        etag: str | None = None,
+        content_length: int | None = None,
+        content_type: str | None = None,
+    ) -> None:
+        """Record that a re-checked document changed, preserving its prior version.
+
+        In one transaction: mark the current ``pdf_version`` row superseded (moving
+        its ``filename`` to ``archived_filename`` -- where the caller has archived
+        the old bytes -- and stamping the *actual* archived ``old_sha256``/
+        ``old_bytes``, which reconciles a stale current-version digest left by an
+        earlier torn write), insert the new current version under the live filename,
+        and flip the ``record`` row's digest/size/provenance and
+        ``last_revalidated_at``. The caller owns the on-disk archive + atomic publish
+        ordering; this method only makes the DB agree with disk.
+        """
+        now = _utcnow_iso()
+        row = self._conn.execute(
+            "SELECT * FROM record WHERE id = ?", (record_id,)
+        ).fetchone()
+        self._conn.execute(
+            """
+            UPDATE pdf_version SET superseded_at = ?, filename = ?,
+                sha256 = ?, bytes = ?
+            WHERE record_id = ? AND superseded_at IS NULL
+            """,
+            (now, archived_filename, old_sha256, old_bytes, record_id),
+        )
+        self._insert_version(
+            record_id=record_id,
+            row=row,
+            filename=row["filename"],
+            sha256=sha256,
+            size=size,
+            fetched_at=now,
+            last_modified=last_modified,
+            etag=etag,
+            content_length=content_length,
+            content_type=content_type,
+        )
+        self._conn.execute(
+            """
+            UPDATE record SET
+                sha256 = ?, bytes = ?, pdf_retrieved_at = ?,
+                http_last_modified = ?, http_etag = ?, http_content_length = ?,
+                http_content_type = ?, last_revalidated_at = ?, error_reason = NULL
+            WHERE id = ?
+            """,
+            (
+                sha256,
+                size,
+                now,
+                last_modified,
+                etag,
+                content_length,
+                content_type,
+                now,
+                record_id,
+            ),
+        )
+        self._conn.commit()
+
+    def _insert_version(
+        self,
+        *,
+        record_id: int,
+        row: sqlite3.Row,
+        filename: str | None,
+        sha256: str,
+        size: int,
+        fetched_at: str,
+        last_modified: str | None,
+        etag: str | None,
+        content_length: int | None,
+        content_type: str | None,
+    ) -> None:
+        """Insert one ``pdf_version`` row (current; ``superseded_at`` left NULL)."""
+        self._conn.execute(
+            """
+            INSERT INTO pdf_version (
+                record_id, document_uuid, pdf_url, neutral_citation, filename,
+                sha256, bytes, fetched_at, http_last_modified, http_etag,
+                http_content_length, http_content_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                row["document_uuid"],
+                row["pdf_url"],
+                row["neutral_citation"],
+                filename,
+                sha256,
+                size,
+                fetched_at,
+                last_modified,
+                etag,
+                content_length,
+                content_type,
+            ),
+        )
+
+    def count_revisions(self) -> int:
+        """Count superseded versions (i.e. detected content changes) in this run."""
+        return self._scalar(
+            "SELECT COUNT(*) FROM pdf_version WHERE superseded_at IS NOT NULL"
+        )
 
     # -- queries ----------------------------------------------------------
     def iter_pending_metadata(self) -> Iterator[sqlite3.Row]:

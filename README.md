@@ -63,6 +63,13 @@ uv run courts-scraper download --run-dir data/<timestamp>__supreme
 # Or do both phases at once
 uv run courts-scraper run --court supreme
 
+# Keep a canonical run current: fetch only newly-published judgments
+uv run courts-scraper update --latest
+uv run courts-scraper update --run-dir data/<timestamp>__supreme --yes
+
+# Also re-check already-downloaded PDFs for server-side changes (costly, opt-in)
+uv run courts-scraper update --latest --revalidate --yes
+
 # Check progress at any time
 uv run courts-scraper status              # also picks a run if not given
 
@@ -79,7 +86,14 @@ uv run courts-scraper data-dictionary
 Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
 `--max-pages` and `--limit` (sampling for testing), `--court` (repeatable),
 `--user-agent` (override the request User-Agent), `--yes` (skip confirmation),
-`--latest` (resume the newest run unattended).
+`--latest` (resume the newest run unattended), `--revalidate` (on `update`, also
+re-fetch downloaded PDFs to detect and version server-side changes).
+
+`download` vs `update`: `download` **finishes** an in-progress crawl (resolve
+metadata and fetch PDFs for rows still pending). `update` **maintains a complete
+run** over time -- it re-lists the run's fixed search so only genuinely-new
+judgments become pending, then fetches just those. Use `download` to complete a
+run; use `update` to keep it current.
 
 ### Choosing courts and confirming
 
@@ -126,14 +140,58 @@ failures, **pauses and re-probes on an escalating interval**, and resumes where
 it left off once the site is back, rather than hammering a down server. If the
 outage outlasts an hour it stops cleanly so you can resume later.
 
+### Keeping a corpus current (evergreen updates)
+
+Instead of a fresh full crawl each period (which re-downloads the entire corpus
+and is impolite to a government server), keep **one canonical run per
+court-selection** and `update` it on a schedule:
+
+```bash
+# One-time: create the canonical run.
+uv run courts-scraper run --court supreme --yes
+
+# Then, on a cadence (cron), fetch only what is new. Use a higher --delay for a
+# scheduled job -- incremental fetch means most runs touch very little.
+uv run courts-scraper update --run-dir data/<timestamp>__supreme --yes --delay 10
+
+# Rebuild the citable corpus after updating, and mint a new Zenodo *version*
+# (same concept-DOI) on your chosen cadence -- not every run.
+uv run courts-scraper corpus --out data/corpus
+```
+
+A cron line for a nightly incremental update:
+
+```cron
+0 3 * * *  cd /path/to/courts-scraper && uv run courts-scraper update \
+             --run-dir data/20260720T231500Z__supreme --yes --delay 10
+```
+
+`update` re-uses the same politeness spacing, retry/backoff, and outage
+circuit-breaker as every other command, so a scheduled job is safe against the
+site's occasional upload-window downtime -- it pauses and resumes rather than
+failing the run.
+
+**`--revalidate` (opt-in, costly).** The Courts Service server exposes no HTTP
+cache validators (no `ETag`/`Last-Modified`, and conditional requests never
+`304`), so there is no cheap way to ask "did this document change?" -- detecting
+a change means re-fetching the file. `update --revalidate` therefore re-downloads
+every already-fetched PDF, and the command tells you the size of that up front and
+refuses to run unattended without `--yes`. When a document **has** changed it
+never overwrites the old version: the previous bytes are archived under
+`pdfs/versions/<sha256>.pdf`, the new bytes become the live file, and the change
+is recorded in the append-only version history (surfaced in the corpus
+`snapshot.json` under `revisions`, with the superseded PDFs carried into the bag
+under fixity). Reserve it for a slower cadence than the incremental `update`.
+
 ## Data folder layout
 
 ```
 data/
   20260720T231500Z__supreme/
     manifest.json        # search query, courts, start time, tool version
-    judgments.sqlite     # all metadata for this run
-    pdfs/                # downloaded judgment PDFs
+    judgments.sqlite     # all metadata + the per-document PDF version history
+    pdfs/                # downloaded judgment PDFs (latest version of each)
+      versions/          # superseded PDF versions, named by sha256 (revalidate)
     logs/
       errors.log         # durable log of skipped/failed items for follow-up
 ```

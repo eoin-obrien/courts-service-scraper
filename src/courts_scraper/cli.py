@@ -5,6 +5,8 @@ Commands:
 * ``list``     -- start a new run and populate the search-results database.
 * ``download`` -- resume a run: scrape view-page metadata and download PDFs.
 * ``run``      -- convenience: ``list`` then ``download`` in one invocation.
+* ``update``   -- maintain a canonical run: fetch only newly-published judgments
+  (and, with ``--revalidate``, re-check downloaded ones for server-side changes).
 * ``status``   -- print progress counts for an existing run folder.
 
 Scraping commands are deliberately not eager: if ``--court`` is omitted you are
@@ -16,9 +18,11 @@ resumable. Press Ctrl-C once to stop cleanly without corrupting data.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -33,6 +37,7 @@ from courts_scraper.query import Court
 from courts_scraper.run import (
     ListingError,
     ListingPreview,
+    RunLocked,
     build_run_config,
     estimate_seconds,
     format_duration,
@@ -41,8 +46,10 @@ from courts_scraper.run import (
     materialize_run,
     open_fetcher,
     preview_listing,
+    revalidate_downloads,
     run_downloads,
     run_listing,
+    run_lock,
     run_metadata,
 )
 from courts_scraper.runs import list_runs
@@ -298,11 +305,170 @@ def download_cmd(
 
         cancel = install_cancel_handler()
         fetcher = open_fetcher(config)
-        run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=console)
-        run_downloads(
-            config, fetcher, repo, cancel=cancel, limit=limit, console=console
-        )
+        try:
+            with run_lock(config.run_dir):
+                run_metadata(
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=console
+                )
+                run_downloads(
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=console
+                )
+        except RunLocked as exc:
+            console.print(f"[yellow]{exc}[/]")
+            raise typer.Exit(code=1) from exc
     _print_status(config)
+
+
+@app.command("update")
+def update_cmd(
+    run_dir: RunDirOption = None,
+    data_dir: DataDirOption = Path("data"),
+    latest: LatestOption = False,
+    revalidate: Annotated[
+        bool,
+        typer.Option(
+            "--revalidate",
+            help="Also re-download every done PDF to detect (and version) "
+            "server-side changes. Costly: the server has no cache validators, so "
+            "this is a full re-fetch of the corpus. Opt-in.",
+        ),
+    ] = False,
+    max_pages: MaxPagesOption = None,
+    delay: DelayOption = 5.0,
+    jitter: JitterOption = 2.0,
+    limit: LimitOption = None,
+    max_attempts: AttemptsOption = 4,
+    timeout: TimeoutOption = 60.0,
+    yes: YesOption = False,
+    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
+) -> None:
+    """Fetch newly-published judgments into a canonical run (evergreen maintenance).
+
+    Re-lists the run's fixed search so only genuinely-new judgments become pending,
+    then scrapes metadata and downloads just those -- so a scheduled job stops
+    re-crawling the whole corpus. With ``--revalidate`` it also re-checks every
+    already-downloaded PDF for server-side changes, preserving the previous bytes
+    and recording each revision. Resumable, polite, and outage-guarded like the
+    other network commands, so it is safe on a cron with ``--yes``.
+    """
+    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    config = _load(resolved, delay, jitter, max_attempts, timeout, user_agent)
+
+    with Repository(config.db_path) as repo:
+        baseline = repo.counts()["total"]
+    if baseline == 0:
+        raise typer.BadParameter(
+            f"{config.run_dir.name} has no baseline listing to update; "
+            "start it with `courts-scraper list` or `run` first."
+        )
+
+    console.print(
+        f"Checking [bold]{config.run_dir.name}[/] for newly-published judgments..."
+    )
+    preview, fetcher = _preview_for_update(config, max_pages)
+    _confirm_update(config, preview, revalidate=revalidate, yes=yes)
+
+    cancel = install_cancel_handler()
+    new_rows = 0
+    revisions = 0
+    try:
+        with run_lock(config.run_dir), Repository(config.db_path) as repo:
+            before = repo.counts()["total"]
+            try:
+                run_listing(config, fetcher, repo, preview=preview, console=console)
+            except httpx.HTTPError:
+                console.print(
+                    "[yellow]Site became unavailable during listing; stopped "
+                    "partway. Re-run `update` to continue where it left off.[/]"
+                )
+                raise typer.Exit(code=1) from None
+            new_rows = repo.counts()["total"] - before
+            console.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
+
+            run_metadata(
+                config, fetcher, repo, cancel=cancel, limit=limit, console=console
+            )
+            # Timestamp before downloading so revalidate skips the rows this same
+            # run is about to fetch (they need no immediate re-check).
+            fetched_before = datetime.now(UTC).isoformat()
+            run_downloads(
+                config, fetcher, repo, cancel=cancel, limit=limit, console=console
+            )
+            if revalidate:
+                revisions = revalidate_downloads(
+                    config,
+                    fetcher,
+                    repo,
+                    cancel=cancel,
+                    limit=limit,
+                    fetched_before=fetched_before,
+                    console=console,
+                )
+    except RunLocked as exc:
+        console.print(f"[yellow]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+    tail = " (see pdfs/versions/ for superseded copies)" if revisions else ""
+    console.print(
+        f"[bold]Update complete:[/] {new_rows} new judgment(s) added, "
+        f"{revisions} revision(s) detected{tail}."
+    )
+    _print_status(config)
+
+
+def _preview_for_update(
+    config: RunConfig, max_pages: int | None
+) -> tuple[ListingPreview, Fetcher]:
+    """Fetch page 0 for an update, exiting cleanly on drift *or* an outage.
+
+    Unlike :func:`_preview_or_exit`, a network failure here is treated as a
+    transient outage (clean "try later" exit) rather than a crash, so a cron
+    firing during the site's upload-window downtime degrades gracefully.
+    """
+    fetcher = open_fetcher(config)
+    try:
+        preview = preview_listing(config, fetcher, max_pages=max_pages)
+    except ListingError as exc:
+        console.print(f"[red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPError:
+        console.print("[yellow]Site unavailable; nothing changed. Try again later.[/]")
+        raise typer.Exit(code=1) from None
+    return preview, fetcher
+
+
+def _confirm_update(
+    config: RunConfig, preview: ListingPreview, *, revalidate: bool, yes: bool
+) -> None:
+    """Show the update's cost (re-list, and revalidate's full re-fetch) and confirm.
+
+    One gate, before any heavy work: the re-list page cost is known now; the
+    new-download cost is only known after the re-list (reported then, as info). The
+    ``--revalidate`` cost is loud and explicit because it re-fetches the whole
+    corpus -- the server exposes no cache validators, so there is no cheap path.
+    """
+    count = preview.total_results
+    scale = f"{count:,}" if count is not None else "an unknown number of"
+    console.print(
+        f"[bold]{', '.join(config.courts)}[/]: re-listing {scale} results across "
+        f"{preview.total_pages} pages to find new judgments."
+    )
+    _print_politeness(
+        config,
+        estimate_seconds(preview.total_pages, delay=config.delay, jitter=config.jitter),
+        upper_bound=True,
+    )
+    if revalidate:
+        with Repository(config.db_path) as repo:
+            done = repo.counts()["download_done"]
+        rev_est = estimate_seconds(done, delay=config.delay, jitter=config.jitter)
+        console.print(
+            f"[yellow]--revalidate re-downloads every downloaded PDF[/] "
+            f"({done:,} files, up to ~{format_duration(rev_est)}) because the "
+            f"server exposes no cache validators. Changed documents are versioned; "
+            f"unchanged are skipped."
+        )
+    prompts.confirm_proceed(assume_yes=yes)
 
 
 @app.command("status")
