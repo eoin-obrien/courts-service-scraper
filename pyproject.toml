@@ -1,0 +1,86 @@
+[project]
+name = "courts-scraper"
+version = "0.1.0"
+description = "Research scraper for written judgments published by the Courts Service of Ireland (ww2.courts.ie)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Eoin O'Brien" }]
+keywords = ["ireland", "courts", "judgments", "legal", "research", "scraper"]
+
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "typer>=0.12",
+    "rich>=13.7",
+    "tenacity>=8.3",
+]
+
+[project.scripts]
+courts-scraper = "courts_scraper.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.2",
+    "pytest-httpx>=0.30",
+    "types-beautifulsoup4",
+    "commitizen>=3.29",
+    "pre-commit>=3.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/courts_scraper"]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "pep621"          # single-source the version from [project]
+version_files = [
+    "src/courts_scraper/__init__.py:__version__",
+]
+tag_format = "v$version"
+update_changelog_on_bump = true
+changelog_incremental = true
+major_version_zero = true            # keep 0.x while the API is unstable
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# An opinionated, broad rule set. E/F (pyflakes/pycodestyle), I (isort),
+# UP (pyupgrade), B (bugbear), SIM (simplify), C4 (comprehensions),
+# PTH (use pathlib), RUF (ruff-specific), D (docstrings).
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PTH", "RUF", "D"]
+ignore = [
+    "D105",  # magic methods (e.g. __enter__) rarely need their own docstring
+    "D203",  # one-blank-line-before-class (conflicts with D211)
+    "D213",  # multi-line-summary-second-line (conflicts with D212)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]  # docstrings not required in tests
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
