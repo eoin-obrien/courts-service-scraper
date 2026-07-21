@@ -286,6 +286,10 @@ class Repository:
             (META_OK, DL_PENDING, DL_ERROR),
         )
 
+    def iter_records(self) -> Iterator[sqlite3.Row]:
+        """Yield every record in id order (the read side for export/corpus)."""
+        yield from self._conn.execute("SELECT * FROM record ORDER BY id")
+
     def taken_filenames(self) -> set[str]:
         """Return the set of filenames already assigned (for collision checks)."""
         cur = self._conn.execute(
