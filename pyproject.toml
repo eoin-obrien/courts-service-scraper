@@ -48,6 +48,7 @@ name = "cz_conventional_commits"
 version_provider = "pep621"          # single-source the version from [project]
 version_files = [
     "src/courts_scraper/__init__.py:__version__",
+    "CITATION.cff:^version",          # keep the citation version in sync (not cff-version)
 ]
 tag_format = "v$version"
 update_changelog_on_bump = true
