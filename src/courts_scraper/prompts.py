@@ -17,6 +17,7 @@ import questionary
 import typer
 
 from courts_scraper.query import Court
+from courts_scraper.runs import RunInfo
 
 
 def is_interactive() -> bool:
@@ -53,6 +54,37 @@ def select_courts() -> tuple[Court, ...]:
     if not selected:  # None (Ctrl-C) or [] (confirmed with nothing checked)
         raise typer.Abort()
     return tuple(selected)
+
+
+def select_run(runs: list[RunInfo]) -> RunInfo:
+    """Prompt for one of the existing runs to resume.
+
+    Args:
+        runs: Discovered runs (newest first).
+
+    Raises:
+        typer.BadParameter: If there are no runs, or there is no interactive
+            terminal to prompt in (the caller must pass ``--run-dir``/``--latest``).
+        typer.Abort: If the user cancels.
+    """
+    if not runs:
+        raise typer.BadParameter(
+            "no existing runs found; start one with `courts-scraper list` or `run`."
+        )
+    if not is_interactive():
+        raise typer.BadParameter(
+            "no --run-dir given and no interactive terminal to prompt in; "
+            "pass --run-dir <folder> or --latest."
+        )
+
+    choices = [questionary.Choice(title=run.summary, value=run) for run in runs]
+    selected: RunInfo | None = questionary.select(
+        "Select a run to resume:", choices=choices
+    ).ask()
+
+    if selected is None:  # Ctrl-C
+        raise typer.Abort()
+    return selected
 
 
 def confirm_proceed(*, assume_yes: bool) -> None:

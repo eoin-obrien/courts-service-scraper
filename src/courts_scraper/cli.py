@@ -43,6 +43,7 @@ from courts_scraper.run import (
     run_listing,
     run_metadata,
 )
+from courts_scraper.runs import list_runs
 
 app = typer.Typer(
     help="Research scraper for Courts Service of Ireland judgments.",
@@ -95,7 +96,15 @@ DataDirOption = Annotated[
     Path, typer.Option("--data-dir", help="Root folder for run data.")
 ]
 RunDirOption = Annotated[
-    Path, typer.Option("--run-dir", help="Existing run folder to resume.")
+    Path | None,
+    typer.Option(
+        "--run-dir",
+        help="Existing run folder to resume. If omitted, pick one interactively.",
+    ),
+]
+LatestOption = Annotated[
+    bool,
+    typer.Option("--latest", help="Resume the most recent run without prompting."),
 ]
 DelayOption = Annotated[
     float, typer.Option("--delay", help="Minimum seconds between requests.")
@@ -250,7 +259,9 @@ def run_cmd(
 
 @app.command("download")
 def download_cmd(
-    run_dir: RunDirOption,
+    run_dir: RunDirOption = None,
+    data_dir: DataDirOption = Path("data"),
+    latest: LatestOption = False,
     delay: DelayOption = 5.0,
     jitter: JitterOption = 2.0,
     limit: LimitOption = None,
@@ -260,7 +271,8 @@ def download_cmd(
     user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
     """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
-    config = _load(run_dir, delay, jitter, max_attempts, timeout, user_agent)
+    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    config = _load(resolved, delay, jitter, max_attempts, timeout, user_agent)
     with Repository(config.db_path) as repo:
         counts = repo.counts()
         remaining = counts["total"] - counts["download_done"]
@@ -295,10 +307,52 @@ def download_cmd(
 
 
 @app.command("status")
-def status_cmd(run_dir: RunDirOption) -> None:
-    """Print progress counts for an existing run folder."""
-    config = _load(run_dir, 5.0, 2.0, 4, 60.0, DEFAULT_USER_AGENT)
+def status_cmd(
+    run_dir: RunDirOption = None,
+    data_dir: DataDirOption = Path("data"),
+    latest: LatestOption = False,
+) -> None:
+    """Print progress counts for a run (picked interactively if not given)."""
+    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    config = _load(resolved, 5.0, 2.0, 4, 60.0, DEFAULT_USER_AGENT)
     _print_status(config)
+
+
+@app.command("runs")
+def runs_cmd(data_dir: DataDirOption = Path("data")) -> None:
+    """List existing runs under the data directory with their progress."""
+    runs = list_runs(data_dir)
+    if not runs:
+        console.print(f"No runs found under [bold]{data_dir}[/].")
+        return
+    table = Table(title=f"Runs in {data_dir}")
+    table.add_column("Run")
+    table.add_column("Courts")
+    table.add_column("Created")
+    table.add_column("Downloaded", justify="right")
+    table.add_column("Errors", justify="right")
+    for run in runs:
+        downloaded = f"{run.done}/{run.total}" if run.readable else "unreadable"
+        table.add_row(
+            run.name,
+            ", ".join(run.courts) or "?",
+            (run.created or "")[:19],
+            downloaded,
+            str(run.error) if run.readable else "-",
+        )
+    console.print(table)
+
+
+def _resolve_run_dir(run_dir: Path | None, data_dir: Path, latest: bool) -> Path:
+    """Resolve which run to act on: explicit path, newest, or interactive pick."""
+    if run_dir is not None:
+        return run_dir
+    if latest:
+        runs = list_runs(data_dir)
+        if not runs:
+            raise typer.BadParameter(f"no runs found under {data_dir}.")
+        return runs[0].path
+    return prompts.select_run(list_runs(data_dir)).path
 
 
 def _build_config(

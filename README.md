@@ -52,19 +52,25 @@ uv sync --extra dev      # create the environment and install dependencies
 # List Supreme Court results into a new run folder under ./data
 uv run courts-scraper list --court supreme
 
-# Resume that run: scrape metadata and download PDFs
+# See existing runs and their progress
+uv run courts-scraper runs
+
+# Resume a run (pick it interactively, or name it, or take the newest)
+uv run courts-scraper download            # prompts you to choose a run
+uv run courts-scraper download --latest   # newest run, no prompt
 uv run courts-scraper download --run-dir data/<timestamp>__supreme
 
 # Or do both phases at once
 uv run courts-scraper run --court supreme
 
 # Check progress at any time
-uv run courts-scraper status --run-dir data/<timestamp>__supreme
+uv run courts-scraper status              # also picks a run if not given
 ```
 
 Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
 `--max-pages` and `--limit` (sampling for testing), `--court` (repeatable),
-`--user-agent` (override the request User-Agent), `--yes` (skip confirmation).
+`--user-agent` (override the request User-Agent), `--yes` (skip confirmation),
+`--latest` (resume the newest run unattended).
 
 ### Choosing courts and confirming
 
@@ -84,13 +90,28 @@ uv run courts-scraper run --court supreme --yes
 In a non-interactive session, the tool never hangs on a prompt: it requires
 `--court` and `--yes` explicitly and errors clearly if either is missing.
 
+### Discovering and resuming runs
+
+`courts-scraper runs` lists every run under the data directory with its progress
+(`done/total`, errors). To resume, `download`/`status` accept a run three ways:
+
+- `--run-dir <folder>` names it explicitly;
+- `--latest` takes the newest run without prompting (good for scripts);
+- with neither, an interactive picker lists your runs (newest first) to choose.
+
+In a non-interactive session the picker never hangs: it errors and tells you to
+pass `--run-dir` or `--latest`.
+
 ### Cancel and resume
 
 Press **Ctrl-C once** to stop cleanly. In-flight downloads are written to a
 `.part` file and only atomically renamed to their final name once complete and
 verified, so cancelling never leaves a half-file that a later run would mistake
-for a finished download. Re-run the same `download` command to resume exactly
-where you stopped.
+for a finished download. Re-run `download` to resume exactly where you stopped.
+
+Network errors (timeouts like `ReadTimeout`, connection drops, `429`/`5xx`) are
+retried automatically with exponential backoff; tune the attempts with
+`--max-attempts`.
 
 ## Data folder layout
 
