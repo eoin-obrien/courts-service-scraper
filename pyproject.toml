@@ -22,6 +22,9 @@ dependencies = [
 courts-scraper = "courts_scraper.cli:app"
 
 [project.optional-dependencies]
+# Optional columnar export format. Referenced by the `export --format parquet`
+# error message; not required for CSV/JSON/datapackage output.
+parquet = ["pyarrow>=16"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.11",
@@ -82,6 +85,12 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 files = ["src"]
+
+# pyarrow is an optional extra and ships no type stubs; the parquet writer
+# imports it lazily behind an ImportError guard.
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

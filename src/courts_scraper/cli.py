@@ -25,6 +25,7 @@ from rich.table import Table
 
 from courts_scraper import __version__, prompts
 from courts_scraper.db import Repository
+from courts_scraper.export import ExportError, export_run
 from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
 from courts_scraper.query import Court
@@ -338,6 +339,41 @@ def runs_cmd(data_dir: DataDirOption = Path("data")) -> None:
             str(run.error) if run.readable else "-",
         )
     console.print(table)
+
+
+@app.command("export")
+def export_cmd(
+    run_dir: RunDirOption = None,
+    data_dir: DataDirOption = Path("data"),
+    latest: LatestOption = False,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Output folder (default: <run>/export)."),
+    ] = None,
+    fmt: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Comma-separated formats: csv, json, parquet.",
+        ),
+    ] = "csv,json",
+) -> None:
+    """Export a run to a Frictionless Data Package (CSV + JSON + optional Parquet)."""
+    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    out_dir = out if out is not None else resolved / "export"
+    formats = [token.strip() for token in fmt.split(",") if token.strip()]
+    if not formats:
+        raise typer.BadParameter("--format must name at least one format.")
+    try:
+        result = export_run(resolved, out_dir, formats)
+    except ExportError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        f"Exported [bold]{result.record_count}[/] records to [bold]{out_dir}[/]:"
+    )
+    for path in result.files:
+        console.print(f"  {path.name}")
 
 
 def _resolve_run_dir(run_dir: Path | None, data_dir: Path, latest: bool) -> Path:
