@@ -29,4 +29,6 @@ archival use of public court judgments. Please:
 
 The maintainers are not responsible for misuse. Downloaded judgments are public
 records; their reuse is subject to the Courts Service of Ireland's terms and
-applicable law.
+applicable law. See the **Disclaimer and responsible use** section of the
+[README](README.md#disclaimer-and-responsible-use) for the full statement
+(no affiliation, personal-data obligations, accuracy, and no warranty).

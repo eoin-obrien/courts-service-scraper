@@ -103,12 +103,31 @@ pre-commit hook (`uv run cz commit` to author one). See
 [CONTRIBUTING.md](CONTRIBUTING.md), the [Code of Conduct](CODE_OF_CONDUCT.md),
 and the [security policy](SECURITY.md).
 
-## Notes on politeness and access
+## Politeness and access
 
 The tool targets a public government website. It serialises requests and spaces
 them out by default. `robots.txt` is not consulted; the judgments are public
 records and requests are made conservatively. Use responsibly and adjust
 `--delay` upward for large crawls.
+
+## Disclaimer and responsible use
+
+This is an independent research tool. It is **not affiliated with, endorsed by,
+or supported by the Courts Service of Ireland.**
+
+- **Responsibility.** You are responsible for using this tool lawfully and for
+  complying with the source website's terms of use and applicable law. It does
+  not consult `robots.txt` (see above); that choice, and how you use the tool,
+  are yours.
+- **Personal data.** Judgments may contain personal information. If you process
+  or redistribute downloaded material, you are responsible for complying with
+  data-protection law (e.g. GDPR) and any reporting restrictions.
+- **Accuracy.** Scraped metadata may be incomplete or incorrect. For any
+  authoritative or citable use, verify against the official record at
+  [`ww2.courts.ie`](https://ww2.courts.ie). The downloaded PDFs are archived
+  exactly as served.
+- **No warranty.** This software is provided "as is", without warranty of any
+  kind. The authors accept no liability for its use. See [LICENSE](LICENSE).
 
 ## Citing
 
