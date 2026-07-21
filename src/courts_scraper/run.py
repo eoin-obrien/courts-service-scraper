@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import signal
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -35,7 +37,11 @@ from courts_scraper.db import Repository
 from courts_scraper.download import (
     CancelToken,
     DownloadCancelled,
+    archive_superseded,
     download_pdf,
+    download_to_scratch,
+    publish_scratch,
+    sha256_of,
     sweep_partials,
 )
 from courts_scraper.http import Fetcher, build_client
@@ -264,6 +270,42 @@ def install_cancel_handler() -> CancelToken:
 
     signal.signal(signal.SIGINT, _handle)
     return token
+
+
+class RunLocked(RuntimeError):
+    """Raised when another process already holds a run's lock."""
+
+
+@contextmanager
+def run_lock(run_dir: Path) -> Iterator[None]:
+    """Hold an exclusive lock on a run for the duration of a network command.
+
+    Two processes operating on the same run (an overlapping cron ``update``, or
+    ``update`` overlapping a manual ``download``) would collide on the shared
+    ``<name>.pdf.part`` scratch files -- interleaving bytes on disk while each
+    records the digest of only its own stream, a silent fixity break in an
+    archival tool. This takes an exclusive advisory ``flock`` so the second process
+    fails fast with a clear message instead. On platforms without ``fcntl`` (e.g.
+    Windows) it degrades to a best-effort no-op.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover -- non-POSIX fallback
+        yield
+        return
+    run_dir.mkdir(parents=True, exist_ok=True)
+    handle = (run_dir / ".lock").open("w")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RunLocked(
+                f"another courts-scraper process is already working on "
+                f"{run_dir.name}; wait for it to finish or stop it first."
+            ) from exc
+        yield
+    finally:
+        handle.close()
 
 
 def _append_error(config: RunConfig, reason: str, detail: str) -> None:
@@ -580,6 +622,168 @@ def _download_row(
         row["id"],
         result.sha256,
         result.size,
+        last_modified=result.last_modified,
+        etag=result.etag,
+        content_length=result.content_length,
+        content_type=result.content_type,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (update --revalidate): re-check downloaded documents for changes
+# ---------------------------------------------------------------------------
+_SCRATCH_SUFFIX = ".part"  # must match download.sweep_partials so orphans are swept
+
+
+def revalidate_downloads(
+    config: RunConfig,
+    fetcher: Fetcher,
+    repo: Repository,
+    *,
+    cancel: CancelToken,
+    limit: int | None = None,
+    fetched_before: str | None = None,
+    console: Console | None = None,
+) -> int:
+    """Re-fetch every downloaded PDF and record any content change (Tier 2).
+
+    The Courts Service server exposes no cache validators (no ``ETag``/
+    ``Last-Modified``, and conditional requests never ``304``), so detecting a
+    change means a full GET of each document -- deliberately opt-in and loud about
+    that cost. For each fully-downloaded record, least-recently-checked first:
+
+    * download a fresh copy to scratch and hash it (no publish yet);
+    * if the digest matches what we stored, discard the scratch and just stamp the
+      row re-checked (bytes and provenance untouched -- unchanged means untouched);
+    * if it differs, archive the previous bytes under ``pdfs/versions/<old-sha>.pdf``,
+      atomically publish the new bytes over the live file, then record a new
+      ``pdf_version`` row -- in that order, so a crash never hides a mutation and no
+      verified version is ever overwritten.
+
+    Politeness spacing and the outage circuit-breaker apply to every fetch; the
+    least-recently-checked ordering makes a ``--limit`` sweep rotate and an
+    interrupted run resume. A per-row fetch failure leaves the good ``done`` file
+    and its (unstamped) row untouched, so it is retried first next time.
+    ``fetched_before`` (an ISO timestamp) skips rows fetched at/after it, so a
+    combined ``update --revalidate`` does not immediately re-download the judgments
+    it just fetched. Returns the number of changed documents detected this run.
+    """
+    console = console or Console()
+    swept = sweep_partials(config.pdf_dir)
+    if swept:
+        console.print(f"Removed {swept} orphaned partial file(s).")
+
+    repo.backfill_pdf_versions()
+    targets = list(repo.iter_revalidation_targets(fetched_before=fetched_before))
+    if limit is not None:
+        targets = targets[:limit]
+    if not targets:
+        console.print("Nothing to revalidate.")
+        return 0
+
+    before = repo.count_revisions()
+    breaker = OutageBreaker(fetcher, config.base_url, console)
+    with _progress(console) as progress:
+        task = progress.add_task("Revalidating PDFs", total=len(targets))
+        for row in targets:
+            if cancel.cancelled:
+                console.print("[yellow]Cancelled during revalidation.[/]")
+                break
+            try:
+                outcome, exc = breaker.run(
+                    partial(_revalidate_row, config, fetcher, repo, row, cancel)
+                )
+            except DownloadCancelled:
+                console.print("[yellow]Cancelled -- scratch discarded.[/]")
+                break
+            except Exception as err:  # unsafe filename etc. -- log, keep row 'done'
+                _append_error(
+                    config,
+                    "revalidate_error",
+                    f"{row['filename']} | {row['pdf_url']} | "
+                    f"{type(err).__name__}: {err}",
+                )
+                console.print(f"[red]Revalidate error:[/] {row['filename']} (skipped)")
+                progress.advance(task)
+                continue
+
+            if outcome is Outcome.GAVE_UP:
+                console.print("[red]Stopping revalidation (site down).[/]")
+                break
+            if outcome is Outcome.DEFER:
+                # Leave the row unchecked (last_revalidated_at untouched) so it is
+                # retried first next run; the good 'done' file is not disturbed.
+                _append_error(
+                    config,
+                    "revalidate_fetch_failed",
+                    f"{row['filename']} | {row['pdf_url']} | {exc}",
+                )
+                console.print(
+                    f"[red]Revalidate fetch failed[/] (will retry on resume): "
+                    f"{row['filename']}"
+                )
+            progress.advance(task)
+
+    return repo.count_revisions() - before
+
+
+def _revalidate_row(
+    config: RunConfig,
+    fetcher: Fetcher,
+    repo: Repository,
+    row: sqlite3.Row,
+    cancel: CancelToken,
+) -> None:
+    """Re-fetch one row's PDF; record a new version iff its bytes changed.
+
+    Never overwrites the live file until the fresh copy is verified and the old
+    bytes are safely archived, so a failure or crash leaves the previous verified
+    version intact (see :func:`revalidate_downloads` for the ordering rationale).
+    The old bytes are archived under *their own* sha256 (read from disk), not the
+    DB's stored digest, so the content-addressed name always matches its content
+    even if an earlier torn write left the live file and the DB row disagreeing.
+    """
+    target = safe_output_path(config.pdf_dir, row["filename"])
+    scratch = target.with_name(target.name + _SCRATCH_SUFFIX)
+    result = download_to_scratch(
+        fetcher,
+        row["pdf_url"],
+        scratch,
+        cancel=cancel,
+        max_attempts=config.max_attempts,
+    )
+
+    stored = None if row["sha256"] is None else str(row["sha256"])
+    live_sha = sha256_of(target) if target.exists() else None
+    if result.sha256 == stored and live_sha == stored:
+        # Genuinely unchanged and the on-disk file already matches: keep the
+        # archived bytes and provenance exactly as they were, just record the check.
+        scratch.unlink(missing_ok=True)
+        repo.mark_revalidated(row["id"])
+        return
+    if result.sha256 == stored:
+        # The server still serves the recorded bytes, but the live file is missing
+        # or was left mismatched by an earlier torn write. Self-heal by publishing
+        # the verified fresh copy over it so disk matches the DB again.
+        publish_scratch(scratch, target)
+        repo.mark_revalidated(row["id"])
+        return
+
+    # Changed: preserve the *actual* old bytes under their true digest (idempotent),
+    # publish the new bytes atomically, then make the DB agree -- in that order so a
+    # crash never hides a mutation and no archive is named by a digest it lacks.
+    old_sha = live_sha if live_sha is not None else (stored or result.sha256)
+    old_bytes = target.stat().st_size if target.exists() else (row["bytes"] or 0)
+    archive = safe_output_path(config.versions_dir, f"{old_sha}.pdf")
+    archive_superseded(target, archive)
+    publish_scratch(scratch, target)
+    repo.record_new_version(
+        row["id"],
+        result.sha256,
+        result.size,
+        archived_filename=f"versions/{old_sha}.pdf",
+        old_sha256=old_sha,
+        old_bytes=int(old_bytes),
         last_modified=result.last_modified,
         etag=result.etag,
         content_length=result.content_length,
