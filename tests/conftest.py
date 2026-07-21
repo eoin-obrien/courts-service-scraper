@@ -43,8 +43,18 @@ def make_run_dir():
     def _make(data_dir, name, *, courts=("Supreme Court",), done=0, total=1):
         run = Path(data_dir) / name
         run.mkdir(parents=True, exist_ok=True)
+        # A manifest complete enough for load_run_config (base_url + query), so a
+        # run built by this fixture can be resumed/inspected through the CLI.
         (run / "manifest.json").write_text(
-            json.dumps({"courts": list(courts), "created": name}), encoding="utf-8"
+            json.dumps(
+                {
+                    "courts": list(courts),
+                    "created": name,
+                    "base_url": BASE_URL,
+                    "query": {},
+                }
+            ),
+            encoding="utf-8",
         )
         with Repository(run / "judgments.sqlite") as repo:
             for i in range(total):

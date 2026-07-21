@@ -21,7 +21,7 @@ def test_committed_data_dictionary_is_in_sync():
     committed = (_REPO_ROOT / "docs" / "DATA_DICTIONARY.md").read_text(encoding="utf-8")
     assert committed == data_dictionary_markdown(), (
         "docs/DATA_DICTIONARY.md is stale -- regenerate with "
-        "`courts-scraper data-dictionary --out docs/DATA_DICTIONARY.md`."
+        "`courts-scraper dictionary --out docs/DATA_DICTIONARY.md`."
     )
 
 

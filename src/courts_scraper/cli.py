@@ -1,23 +1,32 @@
 """Command-line interface for the courts.ie judgments scraper.
 
-Commands:
+Commands (grouped in ``--help`` via panels; flat to type):
 
-* ``list``     -- start a new run and populate the search-results database.
-* ``download`` -- resume a run: scrape view-page metadata and download PDFs.
-* ``run``      -- convenience: ``list`` then ``download`` in one invocation.
-* ``update``   -- maintain a canonical run: fetch only newly-published judgments
+* ``fetch``      -- start a new run, or resume an existing one. Replaces the old
+  ``list`` / ``download`` / ``run`` trio; ``--list-only`` does the listing phase
+  alone. Resume is "just run it again" (``--run-dir``/``--latest``).
+* ``update``     -- maintain a canonical run: fetch only newly-published judgments
   (and, with ``--revalidate``, re-check downloaded ones for server-side changes).
-* ``status``   -- print progress counts for an existing run folder.
+* ``status``     -- print progress counts for an existing run (``--json`` twin).
+* ``runs``       -- list runs under the data directory (``--json`` twin).
+* ``export``     -- one run -> Frictionless Data Package (``--json`` twin).
+* ``corpus``     -- all runs -> citable BagIt bundle (``--json`` twin).
+* ``dictionary`` -- print the export field data dictionary.
 
 Scraping commands are deliberately not eager: if ``--court`` is omitted you are
 prompted to pick courts, and every scrape shows its scale and asks for
 confirmation first. Pass ``--yes`` to skip the confirmation for unattended runs.
 All network commands are polite by default (5s spacing, single worker) and fully
-resumable. Press Ctrl-C once to stop cleanly without corrupting data.
+resumable. Press Ctrl-C once to stop cleanly (exit 0); a second Ctrl-C aborts (130).
+
+``--data-dir`` is a global option: it must precede the subcommand
+(``courts-scraper --data-dir DIR runs``) or come from ``COURTS_SCRAPER_DATA``.
 """
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -52,16 +61,57 @@ from courts_scraper.run import (
     run_lock,
     run_metadata,
 )
-from courts_scraper.runs import list_runs
+from courts_scraper.runs import RunInfo, list_runs
 
 app = typer.Typer(
     help="Research scraper for Courts Service of Ireland judgments.",
     no_args_is_help=True,
     add_completion=False,
+    epilog=(
+        "Typical flow:\n"
+        "  courts-scraper fetch -c supreme     # crawl + download\n"
+        "  courts-scraper status --latest      # check progress\n"
+        "  courts-scraper update --latest      # later: pull new judgments\n"
+        "  courts-scraper export --latest      # publish a data package\n\n"
+        "Exit codes: 0 success (incl. clean first-Ctrl-C stop) | 1 outage/error | "
+        "2 bad usage | 130 second Ctrl-C | 143 SIGTERM."
+    ),
 )
 console = Console()
+err_console = Console(stderr=True)
 
 DEFAULT_USER_AGENT = f"courts-scraper/{__version__} (research tool)"
+
+
+@dataclass
+class AppState:
+    """Session-wide options resolved on the app callback."""
+
+    data_dir: Path
+    quiet: bool = False
+
+
+def _state(ctx: typer.Context) -> AppState:
+    obj = ctx.obj
+    assert isinstance(obj, AppState)  # set by the callback for every invocation
+    return obj
+
+
+def _run_console(state: AppState) -> Console:
+    """The console progress/chrome is written to (silenced by ``--quiet``)."""
+    return Console(quiet=True) if state.quiet else console
+
+
+def _engine_console(state: AppState, *, json_out: bool) -> Console:
+    """Console for engine progress/cancel/error output.
+
+    In ``--json`` mode this must stay OFF stdout so the command emits a single
+    JSON document: send it to stderr (or silence it under ``--quiet``). Otherwise
+    it is the normal stdout progress console.
+    """
+    if json_out:
+        return Console(quiet=True) if state.quiet else err_console
+    return _run_console(state)
 
 
 def _validate_user_agent(value: str) -> str:
@@ -78,6 +128,21 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def _main(
+    ctx: typer.Context,
+    data_dir: Annotated[
+        Path,
+        typer.Option(
+            "--data-dir",
+            envvar="COURTS_SCRAPER_DATA",
+            help="Root folder for run data. As a global option it must come BEFORE "
+            "the subcommand: `courts-scraper --data-dir DIR <command>`. Also read "
+            "from COURTS_SCRAPER_DATA.",
+        ),
+    ] = Path("data"),
+    quiet: Annotated[
+        bool,
+        typer.Option("--quiet", "-q", help="Suppress progress and narration chrome."),
+    ] = False,
     version: Annotated[
         bool,
         typer.Option(
@@ -89,6 +154,7 @@ def _main(
     ] = False,
 ) -> None:
     """Research scraper for Courts Service of Ireland judgments."""
+    ctx.obj = AppState(data_dir=data_dir, quiet=quiet)
 
 
 # Shared option annotations -------------------------------------------------
@@ -98,11 +164,8 @@ CourtOption = Annotated[
         "--court",
         "-c",
         help="Court to include (repeatable): supreme, court_of_appeal, high. "
-        "If omitted, you are prompted to choose.",
+        "If omitted (and no run selector given), you are prompted to choose.",
     ),
-]
-DataDirOption = Annotated[
-    Path, typer.Option("--data-dir", help="Root folder for run data.")
 ]
 RunDirOption = Annotated[
     Path | None,
@@ -113,7 +176,14 @@ RunDirOption = Annotated[
 ]
 LatestOption = Annotated[
     bool,
-    typer.Option("--latest", help="Resume the most recent run without prompting."),
+    typer.Option("--latest", help="Act on the most recent run without prompting."),
+]
+ListOnlyOption = Annotated[
+    bool,
+    typer.Option(
+        "--list-only",
+        help="Record the search results only (no metadata/PDFs). New runs only.",
+    ),
 ]
 DelayOption = Annotated[
     float, typer.Option("--delay", help="Minimum seconds between requests.")
@@ -139,6 +209,13 @@ YesOption = Annotated[
         "--yes", "-y", help="Skip the confirmation prompt (for unattended runs)."
     ),
 ]
+JsonOption = Annotated[
+    bool,
+    typer.Option(
+        "--json",
+        help="Emit machine-readable JSON to stdout (diagnostics go to stderr).",
+    ),
+]
 UserAgentOption = Annotated[
     str,
     typer.Option(
@@ -156,9 +233,14 @@ def _resolve_courts(tokens: list[str]) -> tuple[Court, ...]:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _courts_or_prompt(tokens: list[str]) -> tuple[Court, ...]:
-    """Resolve explicit ``--court`` tokens, or prompt with a multiselect."""
-    return _resolve_courts(tokens) if tokens else prompts.select_courts()
+def _matching_runs(data_dir: Path, courts: tuple[Court, ...]) -> list[RunInfo]:
+    """Readable runs whose court set exactly matches ``courts`` (newest first)."""
+    want = frozenset(c.value for c in courts)
+    return [
+        run
+        for run in list_runs(data_dir)
+        if run.readable and frozenset(run.courts) == want
+    ]
 
 
 def _preview_or_exit(
@@ -169,23 +251,28 @@ def _preview_or_exit(
     try:
         preview = preview_listing(config, fetcher, max_pages=max_pages)
     except ListingError as exc:
-        console.print(f"[red]Error:[/] {exc}")
+        err_console.print(f"[red]Error:[/] {exc}")
         raise typer.Exit(code=1) from exc
     return preview, fetcher
 
 
 def _print_politeness(
-    config: RunConfig, est_seconds: float, *, upper_bound: bool
+    config: RunConfig, est_seconds: float, *, upper_bound: bool, out: Console = console
 ) -> None:
     prefix = "up to ~" if upper_bound else "~"
-    console.print(
+    out.print(
         f"Politeness: {config.delay:g}s + {config.jitter:g}s jitter  "
         f"->  {prefix}{format_duration(est_seconds)}."
     )
 
 
 def _confirm_new_scrape(
-    config: RunConfig, preview: ListingPreview, *, include_downloads: bool, yes: bool
+    config: RunConfig,
+    preview: ListingPreview,
+    *,
+    include_downloads: bool,
+    yes: bool,
+    out: Console = console,
 ) -> None:
     """Show the scale of a fresh crawl and confirm before creating the run."""
     count = preview.total_results
@@ -193,7 +280,7 @@ def _confirm_new_scrape(
     requests = preview.total_pages + (2 * known if include_downloads else 0)
     scale = f"{count:,}" if count is not None else "an unknown number of"
     scope = "list + download" if include_downloads else "list only"
-    console.print(
+    out.print(
         f"[bold]{', '.join(config.courts)}[/]: {scale} results "
         f"across {preview.total_pages} pages ({scope})."
     )
@@ -201,44 +288,33 @@ def _confirm_new_scrape(
         config,
         estimate_seconds(requests, delay=config.delay, jitter=config.jitter),
         upper_bound=include_downloads,
+        out=out,
     )
-    console.print(f"Run folder: [bold]{config.run_dir}[/]")
+    out.print(f"Run folder: [bold]{config.run_dir}[/]")
     prompts.confirm_proceed(assume_yes=yes)
 
 
-@app.command("list")
-def list_cmd(
-    court: CourtOption = [],  # noqa: B006 -- Typer requires a literal default
-    data_dir: DataDirOption = Path("data"),
-    delay: DelayOption = 5.0,
-    jitter: JitterOption = 2.0,
-    max_pages: MaxPagesOption = None,
-    max_attempts: AttemptsOption = 4,
-    timeout: TimeoutOption = 60.0,
-    yes: YesOption = False,
-    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
-) -> None:
-    """Start a new run and record the paginated search results."""
-    config = _build_config(
-        court, data_dir, delay, jitter, max_attempts, timeout, user_agent
-    )
-    preview, fetcher = _preview_or_exit(config, max_pages)
-    _confirm_new_scrape(config, preview, include_downloads=False, yes=yes)
-
-    materialize_run(config)
-    with Repository(config.db_path) as repo:
-        recorded = run_listing(config, fetcher, repo, preview=preview, console=console)
+def _breadcrumb(config: RunConfig) -> None:
+    """Point the user at the exact command to resume an incomplete run."""
     console.print(
-        f"Recorded [bold]{recorded}[/] rows. "
-        f"Resume downloads with:\n  courts-scraper download "
-        f"--run-dir {config.run_dir}"
+        f"Resume with: [bold]courts-scraper fetch --run-dir {config.run_dir}[/]"
     )
 
 
-@app.command("run")
-def run_cmd(
+def _is_incomplete(config: RunConfig) -> bool:
+    with Repository(config.db_path) as repo:
+        complete, _ = _resume_summary(repo.counts())
+    return not complete
+
+
+# fetch: the merged crawl command ------------------------------------------
+@app.command("fetch", rich_help_panel="Crawl")
+def fetch_cmd(
+    ctx: typer.Context,
     court: CourtOption = [],  # noqa: B006 -- Typer requires a literal default
-    data_dir: DataDirOption = Path("data"),
+    run_dir: RunDirOption = None,
+    latest: LatestOption = False,
+    list_only: ListOnlyOption = False,
     delay: DelayOption = 5.0,
     jitter: JitterOption = 2.0,
     max_pages: MaxPagesOption = None,
@@ -248,40 +324,181 @@ def run_cmd(
     yes: YesOption = False,
     user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
-    """Run both phases: list the results, then download every PDF."""
-    config = _build_config(
-        court, data_dir, delay, jitter, max_attempts, timeout, user_agent
+    """Start a new scrape, or resume an existing run (resumable, cancellable)."""
+    state = _state(ctx)
+    resume_selector = run_dir is not None or latest
+
+    if court and resume_selector:
+        raise typer.BadParameter(
+            "--court starts a new run; it cannot be combined with --run-dir/--latest."
+        )
+    if list_only and resume_selector:
+        raise typer.BadParameter(
+            "--list-only starts a new run; it cannot be combined with "
+            "--run-dir/--latest (a resume continues into downloads)."
+        )
+    if list_only and limit is not None:
+        raise typer.BadParameter(
+            "--limit caps downloads, which --list-only does not perform."
+        )
+
+    net = _NetParams(delay, jitter, max_attempts, timeout, user_agent)
+
+    if court:
+        _fetch_new(
+            state,
+            _resolve_courts(court),
+            net,
+            list_only=list_only,
+            max_pages=max_pages,
+            limit=limit,
+            yes=yes,
+        )
+        return
+    if resume_selector:
+        resolved = _resolve_run_dir(run_dir, state.data_dir, latest)
+        _fetch_resume(state, resolved, net, limit=limit, yes=yes)
+        return
+
+    # No selector: interactive front door, or a clear error in a non-TTY.
+    if not prompts.is_interactive():
+        raise typer.BadParameter(
+            "no run selected -- pass --court to start a new run, or "
+            "--latest/--run-dir to resume."
+        )
+    # --list-only always means a fresh listing run, so it never offers a resume
+    # (resuming ignores --list-only and would silently start downloading).
+    resumable = (
+        []
+        if list_only
+        else [r for r in list_runs(state.data_dir) if r.readable and not r.is_complete]
+    )
+    chosen = prompts.select_new_or_run(resumable) if resumable else None
+    if chosen is None:
+        # The user explicitly chose "start new" here, so don't re-offer to resume
+        # a same-court incomplete run inside _fetch_new (that double-prompts).
+        _fetch_new(
+            state,
+            prompts.select_courts(),
+            net,
+            list_only=list_only,
+            max_pages=max_pages,
+            limit=limit,
+            yes=yes,
+            offer_resume=False,
+        )
+    else:
+        _fetch_resume(state, chosen.path, net, limit=limit, yes=yes)
+
+
+@dataclass(frozen=True)
+class _NetParams:
+    """The politeness/transport options shared by the crawl commands."""
+
+    delay: float
+    jitter: float
+    max_attempts: int
+    timeout: float
+    user_agent: str
+
+
+def _fetch_new(
+    state: AppState,
+    courts: tuple[Court, ...],
+    net: _NetParams,
+    *,
+    list_only: bool,
+    max_pages: int | None,
+    limit: int | None,
+    yes: bool,
+    offer_resume: bool = True,
+) -> None:
+    """Start a new run, guarding against duplicate/complete matches first.
+
+    ``offer_resume`` is False when the caller (the interactive front door) has
+    already let the user choose "start new" over resuming, so re-offering a
+    same-court resume here would double-prompt.
+    """
+    matches = _matching_runs(state.data_dir, courts)
+    if any(run.is_complete for run in matches):
+        done = next(run for run in matches if run.is_complete)
+        console.print(
+            f"A complete run for [bold]{', '.join(c.value for c in courts)}[/] "
+            f"already exists ([bold]{done.name}[/]). Use `courts-scraper update` to "
+            f"fetch newly-published judgments, or `--run-dir`/`--latest` to use it."
+        )
+        raise typer.Exit(code=0)
+    # Only runs with listed rows are meaningfully resumable. A zero-row match is
+    # ambiguous (empty court, or a listing interrupted before its first row) and
+    # `is_complete` reports it False while `_resume_summary` reports 0/0 complete;
+    # excluding it here avoids offering a dead-end resume or a duplicate run, and
+    # lets `fetch -c` fall through to a fresh (re-listing) run.
+    incomplete = [run for run in matches if not run.is_complete and run.total > 0]
+    if incomplete and offer_resume:
+        existing = incomplete[0]
+        if prompts.is_interactive():
+            if prompts.confirm_resume_existing(existing):
+                _fetch_resume(state, existing.path, net, limit=limit, yes=yes)
+                return
+        else:
+            err_console.print(
+                f"[yellow]An incomplete run for these courts exists "
+                f"([bold]{existing.name}[/]); starting a NEW run. Resume it instead "
+                f"with: courts-scraper fetch --run-dir {existing.path}[/]"
+            )
+
+    config = build_run_config(
+        data_dir=state.data_dir,
+        courts=courts,
+        delay=net.delay,
+        jitter=net.jitter,
+        max_attempts=net.max_attempts,
+        timeout=net.timeout,
+        user_agent=net.user_agent,
     )
     preview, fetcher = _preview_or_exit(config, max_pages)
-    _confirm_new_scrape(config, preview, include_downloads=True, yes=yes)
+    _confirm_new_scrape(config, preview, include_downloads=not list_only, yes=yes)
 
     materialize_run(config)
+    out = _run_console(state)
     cancel = install_cancel_handler()
-    with Repository(config.db_path) as repo:
-        run_listing(config, fetcher, repo, preview=preview, console=console)
-        run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=console)
-        run_downloads(
-            config, fetcher, repo, cancel=cancel, limit=limit, console=console
-        )
+    recorded = 0
+    # Lock even the fresh run: folder names are only second-precise, so two
+    # `fetch -c` for the same courts started in the same second would otherwise
+    # share a directory and corrupt one SQLite DB / .part set.
+    try:
+        with run_lock(config.run_dir), Repository(config.db_path) as repo:
+            recorded = run_listing(config, fetcher, repo, preview=preview, console=out)
+            if not list_only:
+                run_metadata(
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                )
+                run_downloads(
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                )
+    except RunLocked as exc:
+        err_console.print(f"[yellow]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+    if list_only:
+        console.print(f"Recorded [bold]{recorded}[/] rows (listing only).")
+        _breadcrumb(config)
+        return
     _print_status(config)
+    if _is_incomplete(config):
+        _breadcrumb(config)
 
 
-@app.command("download")
-def download_cmd(
-    run_dir: RunDirOption = None,
-    data_dir: DataDirOption = Path("data"),
-    latest: LatestOption = False,
-    delay: DelayOption = 5.0,
-    jitter: JitterOption = 2.0,
-    limit: LimitOption = None,
-    max_attempts: AttemptsOption = 4,
-    timeout: TimeoutOption = 60.0,
-    yes: YesOption = False,
-    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
+def _fetch_resume(
+    state: AppState,
+    run_dir: Path,
+    net: _NetParams,
+    *,
+    limit: int | None,
+    yes: bool,
 ) -> None:
     """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
-    resolved = _resolve_run_dir(run_dir, data_dir, latest)
-    config = _load(resolved, delay, jitter, max_attempts, timeout, user_agent)
+    config = _load(run_dir, net)
     with Repository(config.db_path) as repo:
         counts = repo.counts()
         complete, lines = _resume_summary(counts)
@@ -289,6 +506,10 @@ def download_cmd(
         for line in lines:
             console.print(line)
         if complete:
+            console.print(
+                "This run is complete. Use `courts-scraper update` to fetch "
+                "newly-published judgments."
+            )
             _print_status(config)
             return
         est_requests = (
@@ -296,33 +517,39 @@ def download_cmd(
             + counts["download_pending"]
             + counts["download_error"]
         )
-        _print_politeness(
-            config,
-            estimate_seconds(est_requests, delay=config.delay, jitter=config.jitter),
-            upper_bound=True,
-        )
+        if not state.quiet:
+            _print_politeness(
+                config,
+                estimate_seconds(
+                    est_requests, delay=config.delay, jitter=config.jitter
+                ),
+                upper_bound=True,
+            )
         prompts.confirm_proceed(assume_yes=yes)
 
         cancel = install_cancel_handler()
         fetcher = open_fetcher(config)
+        out = _run_console(state)
         try:
             with run_lock(config.run_dir):
                 run_metadata(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=console
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
                 )
                 run_downloads(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=console
+                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
                 )
         except RunLocked as exc:
-            console.print(f"[yellow]{exc}[/]")
+            err_console.print(f"[yellow]{exc}[/]")
             raise typer.Exit(code=1) from exc
     _print_status(config)
+    if _is_incomplete(config):
+        _breadcrumb(config)
 
 
-@app.command("update")
+@app.command("update", rich_help_panel="Crawl")
 def update_cmd(
+    ctx: typer.Context,
     run_dir: RunDirOption = None,
-    data_dir: DataDirOption = Path("data"),
     latest: LatestOption = False,
     revalidate: Annotated[
         bool,
@@ -340,6 +567,7 @@ def update_cmd(
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
     yes: YesOption = False,
+    json_out: JsonOption = False,
     user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
     """Fetch newly-published judgments into a canonical run (evergreen maintenance).
@@ -351,48 +579,56 @@ def update_cmd(
     and recording each revision. Resumable, polite, and outage-guarded like the
     other network commands, so it is safe on a cron with ``--yes``.
     """
-    resolved = _resolve_run_dir(run_dir, data_dir, latest)
-    config = _load(resolved, delay, jitter, max_attempts, timeout, user_agent)
+    state = _state(ctx)
+    _json_selector_guard(run_dir, latest, json_out=json_out)
+    if json_out and not yes:
+        raise typer.BadParameter(
+            "--json needs --yes (it will not prompt for confirmation)."
+        )
+    msg = err_console if json_out else console
+    resolved = _resolve_run_dir(run_dir, state.data_dir, latest)
+    config = _load(
+        resolved, _NetParams(delay, jitter, max_attempts, timeout, user_agent)
+    )
 
     with Repository(config.db_path) as repo:
         baseline = repo.counts()["total"]
     if baseline == 0:
         raise typer.BadParameter(
             f"{config.run_dir.name} has no baseline listing to update; "
-            "start it with `courts-scraper list` or `run` first."
+            "start it with `courts-scraper fetch --court supreme` first."
         )
 
-    console.print(
+    msg.print(
         f"Checking [bold]{config.run_dir.name}[/] for newly-published judgments..."
     )
     preview, fetcher = _preview_for_update(config, max_pages)
-    _confirm_update(config, preview, revalidate=revalidate, yes=yes)
+    _confirm_update(config, preview, revalidate=revalidate, yes=yes, out=msg)
 
     cancel = install_cancel_handler()
+    out = _engine_console(state, json_out=json_out)
     new_rows = 0
     revisions = 0
     try:
         with run_lock(config.run_dir), Repository(config.db_path) as repo:
             before = repo.counts()["total"]
             try:
-                run_listing(config, fetcher, repo, preview=preview, console=console)
+                run_listing(config, fetcher, repo, preview=preview, console=out)
             except httpx.HTTPError:
-                console.print(
+                msg.print(
                     "[yellow]Site became unavailable during listing; stopped "
                     "partway. Re-run `update` to continue where it left off.[/]"
                 )
                 raise typer.Exit(code=1) from None
             new_rows = repo.counts()["total"] - before
-            console.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
+            msg.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
 
-            run_metadata(
-                config, fetcher, repo, cancel=cancel, limit=limit, console=console
-            )
+            run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=out)
             # Timestamp before downloading so revalidate skips the rows this same
             # run is about to fetch (they need no immediate re-check).
             fetched_before = datetime.now(UTC).isoformat()
             run_downloads(
-                config, fetcher, repo, cancel=cancel, limit=limit, console=console
+                config, fetcher, repo, cancel=cancel, limit=limit, console=out
             )
             if revalidate:
                 revisions = revalidate_downloads(
@@ -402,12 +638,26 @@ def update_cmd(
                     cancel=cancel,
                     limit=limit,
                     fetched_before=fetched_before,
-                    console=console,
+                    console=out,
                 )
     except RunLocked as exc:
-        console.print(f"[yellow]{exc}[/]")
+        msg.print(f"[yellow]{exc}[/]")
         raise typer.Exit(code=1) from exc
 
+    with Repository(config.db_path) as repo:
+        errors = repo.counts()["download_error"]
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "new": new_rows,
+                    "revisions": revisions,
+                    "errors": errors,
+                    "run": config.run_dir.name,
+                }
+            )
+        )
+        return
     tail = " (see pdfs/versions/ for superseded copies)" if revisions else ""
     console.print(
         f"[bold]Update complete:[/] {new_rows} new judgment(s) added, "
@@ -429,16 +679,23 @@ def _preview_for_update(
     try:
         preview = preview_listing(config, fetcher, max_pages=max_pages)
     except ListingError as exc:
-        console.print(f"[red]Error:[/] {exc}")
+        err_console.print(f"[red]Error:[/] {exc}")
         raise typer.Exit(code=1) from exc
     except httpx.HTTPError:
-        console.print("[yellow]Site unavailable; nothing changed. Try again later.[/]")
+        err_console.print(
+            "[yellow]Site unavailable; nothing changed. Try again later.[/]"
+        )
         raise typer.Exit(code=1) from None
     return preview, fetcher
 
 
 def _confirm_update(
-    config: RunConfig, preview: ListingPreview, *, revalidate: bool, yes: bool
+    config: RunConfig,
+    preview: ListingPreview,
+    *,
+    revalidate: bool,
+    yes: bool,
+    out: Console = console,
 ) -> None:
     """Show the update's cost (re-list, and revalidate's full re-fetch) and confirm.
 
@@ -449,7 +706,7 @@ def _confirm_update(
     """
     count = preview.total_results
     scale = f"{count:,}" if count is not None else "an unknown number of"
-    console.print(
+    out.print(
         f"[bold]{', '.join(config.courts)}[/]: re-listing {scale} results across "
         f"{preview.total_pages} pages to find new judgments."
     )
@@ -457,12 +714,13 @@ def _confirm_update(
         config,
         estimate_seconds(preview.total_pages, delay=config.delay, jitter=config.jitter),
         upper_bound=True,
+        out=out,
     )
     if revalidate:
         with Repository(config.db_path) as repo:
             done = repo.counts()["download_done"]
         rev_est = estimate_seconds(done, delay=config.delay, jitter=config.jitter)
-        console.print(
+        out.print(
             f"[yellow]--revalidate re-downloads every downloaded PDF[/] "
             f"({done:,} files, up to ~{format_duration(rev_est)}) because the "
             f"server exposes no cache validators. Changed documents are versioned; "
@@ -471,22 +729,34 @@ def _confirm_update(
     prompts.confirm_proceed(assume_yes=yes)
 
 
-@app.command("status")
+@app.command("status", rich_help_panel="Inspect")
 def status_cmd(
+    ctx: typer.Context,
     run_dir: RunDirOption = None,
-    data_dir: DataDirOption = Path("data"),
     latest: LatestOption = False,
+    json_out: JsonOption = False,
 ) -> None:
     """Print progress counts for a run (picked interactively if not given)."""
-    resolved = _resolve_run_dir(run_dir, data_dir, latest)
-    config = _load(resolved, 5.0, 2.0, 4, 60.0, DEFAULT_USER_AGENT)
-    _print_status(config)
+    state = _state(ctx)
+    _json_selector_guard(run_dir, latest, json_out=json_out)
+    resolved = _resolve_run_dir(run_dir, state.data_dir, latest)
+    config = _load(resolved, _NetParams(5.0, 2.0, 4, 60.0, DEFAULT_USER_AGENT))
+    with Repository(config.db_path) as repo:
+        counts = repo.counts()
+    if json_out:
+        print(json.dumps({**counts, "run": config.run_dir.name}))
+        return
+    _print_status_table(config.run_dir.name, counts)
 
 
-@app.command("runs")
-def runs_cmd(data_dir: DataDirOption = Path("data")) -> None:
+@app.command("runs", rich_help_panel="Inspect")
+def runs_cmd(ctx: typer.Context, json_out: JsonOption = False) -> None:
     """List existing runs under the data directory with their progress."""
+    data_dir = _state(ctx).data_dir
     runs = list_runs(data_dir)
+    if json_out:
+        print(json.dumps([run.to_dict() for run in runs]))
+        return
     if not runs:
         console.print(f"No runs found under [bold]{data_dir}[/].")
         return
@@ -508,10 +778,10 @@ def runs_cmd(data_dir: DataDirOption = Path("data")) -> None:
     console.print(table)
 
 
-@app.command("export")
+@app.command("export", rich_help_panel="Publish")
 def export_cmd(
+    ctx: typer.Context,
     run_dir: RunDirOption = None,
-    data_dir: DataDirOption = Path("data"),
     latest: LatestOption = False,
     out: Annotated[
         Path | None,
@@ -525,9 +795,11 @@ def export_cmd(
             help="Comma-separated formats: csv, json, parquet.",
         ),
     ] = "csv,json",
+    json_out: JsonOption = False,
 ) -> None:
     """Export a run to a Frictionless Data Package (CSV + JSON + optional Parquet)."""
-    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    _json_selector_guard(run_dir, latest, json_out=json_out)
+    resolved = _resolve_run_dir(run_dir, _state(ctx).data_dir, latest)
     out_dir = out if out is not None else resolved / "export"
     formats = [token.strip() for token in fmt.split(",") if token.strip()]
     if not formats:
@@ -536,6 +808,18 @@ def export_cmd(
         result = export_run(resolved, out_dir, formats)
     except (ExportError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "record_count": result.record_count,
+                    "out_dir": str(out_dir),
+                    "files": [path.name for path in result.files],
+                    "formats": formats,
+                }
+            )
+        )
+        return
     console.print(
         f"Exported [bold]{result.record_count}[/] records to [bold]{out_dir}[/]:"
     )
@@ -543,8 +827,8 @@ def export_cmd(
         console.print(f"  {path.name}")
 
 
-@app.command("data-dictionary")
-def data_dictionary_cmd(
+@app.command("dictionary", rich_help_panel="Publish")
+def dictionary_cmd(
     out: Annotated[
         Path | None,
         typer.Option("--out", help="Write to this file instead of stdout."),
@@ -553,16 +837,18 @@ def data_dictionary_cmd(
     """Print (or write) the export data dictionary, generated from the schema."""
     markdown = data_dictionary_markdown()
     if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(markdown, encoding="utf-8")
-        console.print(f"Wrote data dictionary to [bold]{out}[/].")
+        # Confirmation to stderr so a piped stdout stays clean.
+        err_console.print(f"Wrote data dictionary to [bold]{out}[/].")
     else:
         # Plain stdout so it can be piped to a file; bypass Rich markup.
         print(markdown, end="")
 
 
-@app.command("corpus")
+@app.command("corpus", rich_help_panel="Publish")
 def corpus_cmd(
-    data_dir: DataDirOption = Path("data"),
+    ctx: typer.Context,
     out: Annotated[
         Path | None,
         typer.Option("--out", help="Output bag folder (default: <data-dir>/corpus)."),
@@ -571,8 +857,10 @@ def corpus_cmd(
         str,
         typer.Option("--format", "-f", help="Comma-separated: csv, json, parquet."),
     ] = "csv,json",
+    json_out: JsonOption = False,
 ) -> None:
     """Merge all runs into one citable BagIt corpus (dedup + fixity + datasheet)."""
+    data_dir = _state(ctx).data_dir
     run_dirs = [run.path for run in list_runs(data_dir) if run.readable]
     if not run_dirs:
         raise typer.BadParameter(f"no readable runs under {data_dir}.")
@@ -584,6 +872,21 @@ def corpus_cmd(
         result = build_corpus(run_dirs, out_dir, formats=formats)
     except (ExportError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "record_count": result.record_count,
+                    "run_count": len(run_dirs),
+                    "out_dir": str(out_dir),
+                    "conflicts": len(result.conflicts),
+                    "missing_pdfs": len(result.missing_pdfs),
+                    "unverified_versions": len(result.unverified_versions),
+                }
+            )
+        )
+        return
 
     console.print(
         f"Corpus: [bold]{result.record_count}[/] records from "
@@ -605,6 +908,19 @@ def corpus_cmd(
             f"unverifiable[/] (missing or digest mismatch) and omitted from the bag."
         )
     console.print("Verify fixity with any BagIt tool (manifest-sha256.txt).")
+
+
+def _json_selector_guard(run_dir: Path | None, latest: bool, *, json_out: bool) -> None:
+    """In --json mode, refuse to open the interactive run picker.
+
+    Otherwise ``status --json`` / ``export --json`` with no selector would prompt
+    on stdout in a TTY, breaking the "stdout is one JSON document" contract.
+    """
+    if json_out and run_dir is None and not latest:
+        raise typer.BadParameter(
+            "--json needs an explicit run: pass --run-dir or --latest "
+            "(it will not open an interactive picker)."
+        )
 
 
 def _resolve_run_dir(run_dir: Path | None, data_dir: Path, latest: bool) -> Path:
@@ -655,43 +971,15 @@ def _resume_summary(counts: dict[str, int]) -> tuple[bool, list[str]]:
     return False, [meta_line + ".", dl_line + "."]
 
 
-def _build_config(
-    court: list[str],
-    data_dir: Path,
-    delay: float,
-    jitter: float,
-    max_attempts: int,
-    timeout: float,
-    user_agent: str,
-) -> RunConfig:
-    courts = _courts_or_prompt(court)
-    return build_run_config(
-        data_dir=data_dir,
-        courts=courts,
-        delay=delay,
-        jitter=jitter,
-        max_attempts=max_attempts,
-        timeout=timeout,
-        user_agent=user_agent,
-    )
-
-
-def _load(
-    run_dir: Path,
-    delay: float,
-    jitter: float,
-    max_attempts: int,
-    timeout: float,
-    user_agent: str,
-) -> RunConfig:
+def _load(run_dir: Path, net: _NetParams) -> RunConfig:
     try:
         return load_run_config(
             run_dir,
-            delay=delay,
-            jitter=jitter,
-            max_attempts=max_attempts,
-            timeout=timeout,
-            user_agent=user_agent,
+            delay=net.delay,
+            jitter=net.jitter,
+            max_attempts=net.max_attempts,
+            timeout=net.timeout,
+            user_agent=net.user_agent,
         )
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -700,7 +988,11 @@ def _load(
 def _print_status(config: RunConfig) -> None:
     with Repository(config.db_path) as repo:
         counts = repo.counts()
-    table = Table(title=f"Run status: {config.run_dir.name}")
+    _print_status_table(config.run_dir.name, counts)
+
+
+def _print_status_table(run_name: str, counts: dict[str, int]) -> None:
+    table = Table(title=f"Run status: {run_name}")
     table.add_column("Metric")
     table.add_column("Count", justify="right")
     for key, value in counts.items():
