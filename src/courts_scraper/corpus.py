@@ -32,6 +32,7 @@ from courts_scraper.dataset import DERIVE_VERSION, Derived, iter_records
 from courts_scraper.db import SCHEMA_VERSION
 from courts_scraper.download import sha256_of
 from courts_scraper.export import EXPORT_FIELDS, ExportError, write_package
+from courts_scraper.naming import UnsafeFilenameError, safe_output_path
 
 _BAGIT_VERSION = "1.0"
 _DL_DONE = "done"
@@ -156,10 +157,40 @@ def _merge_sources(run_dirs: list[Path]) -> tuple[str | None, list[str]]:
     return base_url, courts
 
 
+def _assign_bag_filenames(merge: MergeResult) -> dict[str, str]:
+    """Give each downloaded winner a bag-unique filename, rewriting ``filename``.
+
+    Filenames are unique only within one run; the merged bag flattens PDFs from
+    many runs into a single folder, so two distinct documents can share a name.
+    On collision we assign a deterministic ``__N`` suffix (pairs are already in a
+    stable sorted order) so the exported ``filename`` column and the bagged file
+    always agree and no PDF silently overwrites another. Returns identity ->
+    original source filename, so the copy step can still find the run's file.
+    """
+    seen: set[str] = set()
+    source_names: dict[str, str] = {}
+    for raw, _ in merge.pairs:
+        if raw["download_status"] != _DL_DONE or not raw["filename"]:
+            continue
+        ident = _identity(raw)
+        original = str(raw["filename"])
+        source_names[ident] = original
+        bag_name = original
+        if bag_name in seen:
+            stem, dot, ext = original.partition(".")
+            n = 2
+            while (candidate := f"{stem}__{n}{dot}{ext}") in seen:
+                n += 1
+            bag_name = candidate
+        seen.add(bag_name)
+        raw["filename"] = bag_name
+    return source_names
+
+
 def _copy_pdfs(
-    merge: MergeResult, run_dirs: list[Path], dest: Path
+    merge: MergeResult, run_dirs: list[Path], dest: Path, source_names: dict[str, str]
 ) -> tuple[list[Path], list[str]]:
-    """Copy each downloaded winner's PDF from its source run into ``dest``.
+    """Copy each downloaded winner's PDF into ``dest`` under its bag-unique name.
 
     Returns the copied paths and the filenames that were expected (download done)
     but missing on disk -- a fixity gap the caller surfaces, never hides.
@@ -171,13 +202,21 @@ def _copy_pdfs(
     for raw, _ in merge.pairs:
         if raw["download_status"] != _DL_DONE or not raw["filename"]:
             continue
-        filename = str(raw["filename"])
-        run_dir = by_name[merge.source_run[_identity(raw)]]
-        source = run_dir / "pdfs" / filename
-        if not source.exists():
-            missing.append(filename)
+        ident = _identity(raw)
+        original = source_names[ident]
+        bag_name = str(raw["filename"])  # already made unique by _assign_bag_filenames
+        run_dir = by_name[merge.source_run[ident]]
+        # Defence in depth: a tampered DB filename must not read or write outside
+        # the run's pdfs/ or the bag payload (matches run.py's download boundary).
+        try:
+            source = safe_output_path(run_dir / "pdfs", original)
+            target = safe_output_path(dest, bag_name)
+        except UnsafeFilenameError:
+            missing.append(original)
             continue
-        target = dest / filename
+        if not source.exists():
+            missing.append(original)
+            continue
         shutil.copy2(source, target)
         copied.append(target)
     return copied, missing
@@ -205,9 +244,16 @@ def _snapshot(merge: MergeResult, record_count: int) -> dict[str, object]:
 
 def _dataset_jsonld(descriptor: dict[str, object]) -> dict[str, object]:
     coverage = descriptor.get("coverage", {})
-    assert isinstance(coverage, dict)
+    if not isinstance(coverage, dict):
+        coverage = {}
     lo, hi = coverage.get("date_delivered_min"), coverage.get("date_delivered_max")
     temporal = f"{lo}/{hi}" if lo and hi else None
+    # Point the distribution at the resource the descriptor actually wrote, not a
+    # hard-coded CSV that may not exist for a json/parquet-only export.
+    resources = descriptor.get("resources")
+    resource = resources[0] if isinstance(resources, list) and resources else {}
+    content_url = resource.get("path", "judgments.csv")
+    encoding = resource.get("mediatype", "text/csv")
     return {
         "@context": "https://schema.org/",
         "@type": "Dataset",
@@ -228,8 +274,8 @@ def _dataset_jsonld(descriptor: dict[str, object]) -> dict[str, object]:
         "distribution": [
             {
                 "@type": "DataDownload",
-                "encodingFormat": "text/csv",
-                "contentUrl": "judgments.csv",
+                "encodingFormat": encoding,
+                "contentUrl": content_url,
             }
         ],
     }
@@ -341,8 +387,15 @@ def build_corpus(
     merge = merge_runs(runs)
     record_count = len(merge.pairs)
     base_url, courts = _merge_sources(runs)
+    # Assign bag-unique filenames before writing the tabular package, so the CSV
+    # 'filename' column matches the (collision-free) bagged files.
+    source_names = _assign_bag_filenames(merge)
 
     data_dir = out_dir / "data"
+    # Start from a clean payload: the manifest hashes every file under data/, so
+    # leftovers from a prior build would be attested into this snapshot's fixity.
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
     snapshot = _snapshot(merge, record_count)
 
     # Tabular package (reuses the exact export writers) into the bag payload.
@@ -356,7 +409,7 @@ def build_corpus(
     )
 
     # PDFs + docs into the payload.
-    _copied, missing = _copy_pdfs(merge, runs, data_dir / "pdfs")
+    _copied, missing = _copy_pdfs(merge, runs, data_dir / "pdfs", source_names)
 
     descriptor = json.loads((data_dir / "datapackage.json").read_text(encoding="utf-8"))
     (data_dir / "dataset.jsonld").write_text(

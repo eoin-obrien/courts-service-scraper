@@ -260,13 +260,27 @@ def _json_record(raw: RowLike, derived: Derived) -> dict[str, object]:
     return record
 
 
+# Leading characters a spreadsheet treats as the start of a formula. Scraped
+# text (titles, judge names, ...) flows into judgments.csv, which is opened in
+# Excel/Sheets, so a cell beginning with one of these is neutralised.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _csv_value(value: object) -> str:
-    """Encode one cell for CSV: None -> '' (missingValues), bool -> true/false."""
+    """Encode one cell for CSV: None -> '' (missingValues), bool -> true/false.
+
+    Neutralises CSV formula injection: a value starting with a formula prefix is
+    prepended with a single quote so a spreadsheet renders it as text, not a live
+    formula. ``csv.writer`` already handles comma/quote/newline quoting.
+    """
     if value is None:
         return ""
     if isinstance(value, bool):  # bool before int -- bool is an int subclass
         return "true" if value else "false"
-    return str(value)
+    text = str(value)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
 
 
 def _now_iso() -> str:
@@ -310,19 +324,32 @@ def _manifest(run_dir: Path) -> dict[str, object]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+_RESOURCE_META: dict[str, tuple[str, str, str]] = {
+    "csv": ("judgments.csv", "csv", "text/csv"),
+    "json": ("judgments.json", "json", "application/json"),
+    "parquet": ("judgments.parquet", "parquet", "application/vnd.apache.parquet"),
+}
+# Preference order when choosing the descriptor's primary resource.
+_PRIMARY_ORDER: tuple[str, ...] = ("csv", "json", "parquet")
+
+
 def build_datapackage(
     rows: list[dict[str, object]],
     *,
     base_url: str | None = None,
     courts: list[str] | None = None,
     extra: dict[str, object] | None = None,
+    formats: Iterable[str] = ("csv",),
 ) -> dict[str, object]:
     """Assemble the ``datapackage.json`` descriptor for the exported rows.
 
     ``base_url``/``courts`` come from the run manifest (single-run export) or the
     merge inputs (corpus). ``extra`` merges in extra top-level keys, e.g. a corpus
-    snapshot's source-run set.
+    snapshot's source-run set. ``formats`` are the tabular files actually written,
+    so the descriptor's resource points at a file that exists.
     """
+    written = [f for f in _PRIMARY_ORDER if f in set(formats)] or ["csv"]
+    res_path, res_format, res_media = _RESOURCE_META[written[0]]
     sources = []
     if base_url:
         sources.append({"title": "Courts Service of Ireland", "path": base_url})
@@ -347,10 +374,10 @@ def build_datapackage(
         "resources": [
             {
                 "name": "judgments",
-                "path": "judgments.csv",
+                "path": res_path,
                 "profile": "tabular-data-resource",
-                "format": "csv",
-                "mediatype": "text/csv",
+                "format": res_format,
+                "mediatype": res_media,
                 "encoding": "utf-8",
                 "schema": _schema(),
             }
@@ -442,7 +469,9 @@ def write_package(
     descriptor = out_dir / "datapackage.json"
     descriptor.write_text(
         json.dumps(
-            build_datapackage(flat, base_url=base_url, courts=courts, extra=extra),
+            build_datapackage(
+                flat, base_url=base_url, courts=courts, extra=extra, formats=requested
+            ),
             ensure_ascii=False,
             indent=2,
         ),

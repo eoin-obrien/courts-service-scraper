@@ -3,7 +3,12 @@ from datetime import datetime
 
 import pytest
 
-from courts_scraper.db import _ADDED_COLUMNS, SCHEMA_VERSION, Repository
+from courts_scraper.db import (
+    _ADDED_COLUMNS,
+    RECORD_COLUMNS,
+    SCHEMA_VERSION,
+    Repository,
+)
 from courts_scraper.models import JudgmentMeta, ListRow
 
 # The v1 record table, before any provenance columns -- used to fabricate an
@@ -126,6 +131,30 @@ def test_migrate_on_open_is_idempotent(tmp_path):
         version = repo._conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
     assert list(_columns(db_path)).count("listed_at") == 1
+
+
+def test_record_columns_matches_the_live_schema(tmp_path):
+    # Guards the explicit RECORD_COLUMNS constant against schema drift.
+    db_path = tmp_path / "judgments.sqlite"
+    with Repository(db_path):
+        pass
+    assert set(RECORD_COLUMNS) == _columns(db_path)
+    assert len(RECORD_COLUMNS) == len(set(RECORD_COLUMNS))  # no duplicates
+
+
+def test_migrate_does_not_downstamp_a_newer_db(tmp_path):
+    db_path = tmp_path / "judgments.sqlite"
+    with Repository(db_path):
+        pass
+    # A DB written by a hypothetical future version.
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA user_version = 99")
+    conn.commit()
+    conn.close()
+
+    with Repository(db_path) as repo:
+        version = repo._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 99  # migrate-on-open must not downgrade the stamp
 
 
 def test_phase_timestamps_are_stamped(repo):

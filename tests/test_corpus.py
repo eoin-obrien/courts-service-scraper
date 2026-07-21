@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import sqlite3
@@ -173,6 +174,21 @@ def test_missing_pdf_is_surfaced_not_hidden(tmp_path):
     assert result.missing_pdfs == ("f1.pdf",)
 
 
+def test_unsafe_pdf_filename_is_skipped_not_escaped(tmp_path):
+    # A tampered DB filename must never let the bag copy read/write outside dest.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="ok.pdf")
+    conn = sqlite3.connect(r1 / "judgments.sqlite")
+    conn.execute("UPDATE record SET filename = ?", ("../../escape.pdf",))
+    conn.commit()
+    conn.close()
+
+    bag = tmp_path / "bag"
+    result = build_corpus([r1], bag, formats=("csv",))
+
+    assert result.missing_pdfs == ("../../escape.pdf",)  # surfaced, not copied
+    assert not (tmp_path / "escape.pdf").exists()  # nothing escaped the bag
+
+
 def test_dataset_jsonld_is_schema_org(tmp_path):
     r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa")
     bag = tmp_path / "bag"
@@ -181,6 +197,55 @@ def test_dataset_jsonld_is_schema_org(tmp_path):
     assert doc["@type"] == "Dataset"
     assert doc["spatialCoverage"] == "Ireland"
     assert doc["variableMeasured"]  # non-empty variable list
+
+
+def test_cross_run_filename_collision_gets_unique_bag_names(tmp_path):
+    # Two DIFFERENT documents that slug to the same filename, different content.
+    r1 = _make_run(
+        tmp_path / "run1",
+        uuid="d1",
+        sha="aaa",
+        filename="same.pdf",
+        pdf_bytes=b"%PDF-1.7 AAA",
+    )
+    r2 = _make_run(
+        tmp_path / "run2",
+        uuid="d2",
+        sha="bbb",
+        filename="same.pdf",
+        pdf_bytes=b"%PDF-1.7 BBB",
+    )
+    bag = tmp_path / "bag"
+    result = build_corpus([r1, r2], bag, formats=("csv",))
+
+    assert result.record_count == 2
+    pdfs = sorted(p.name for p in (bag / "data" / "pdfs").glob("*.pdf"))
+    assert len(pdfs) == 2  # neither silently overwrote the other
+    contents = {(bag / "data" / "pdfs" / n).read_bytes() for n in pdfs}
+    assert contents == {b"%PDF-1.7 AAA", b"%PDF-1.7 BBB"}
+    # CSV filename column matches the bagged files exactly.
+    with (bag / "data" / "judgments.csv").open(encoding="utf-8", newline="") as f:
+        filenames = {row["filename"] for row in csv.DictReader(f)}
+    assert filenames == set(pdfs)
+
+
+def test_rebuild_cleans_stale_payload(tmp_path):
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    bag = tmp_path / "bag"
+    build_corpus([r1], bag, formats=("csv",))
+
+    # Simulate leftovers from a prior, larger build.
+    stale_pdf = bag / "data" / "pdfs" / "stale.pdf"
+    stale_pdf.write_bytes(b"%PDF-1.7 stale")
+    (bag / "data" / "OLD.txt").write_text("old", encoding="utf-8")
+
+    build_corpus([r1], bag, formats=("csv",))  # rebuild must clean first
+
+    assert not stale_pdf.exists()
+    assert not (bag / "data" / "OLD.txt").exists()
+    manifest = (bag / "manifest-sha256.txt").read_text(encoding="utf-8")
+    assert "stale.pdf" not in manifest
+    assert "OLD.txt" not in manifest
 
 
 def test_empty_run_list_raises(tmp_path):

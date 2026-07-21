@@ -91,6 +91,53 @@ def _utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# The v1 ``record`` columns, in declaration order (see ``_SCHEMA``). Kept explicit
+# so the read-only reader knows the full expected shape without opening a DB; a
+# drift-guard test asserts this matches a freshly-created table.
+_BASE_COLUMNS: tuple[str, ...] = (
+    "id",
+    "page",
+    "title",
+    "court",
+    "judge",
+    "date_delivered",
+    "date_uploaded",
+    "view_url",
+    "pdf_url",
+    "collection_uuid",
+    "document_uuid",
+    "neutral_citation",
+    "record_number",
+    "status_field",
+    "result",
+    "composition",
+    "meta_json",
+    "filename",
+    "sha256",
+    "bytes",
+    "meta_status",
+    "download_status",
+    "error_reason",
+)
+
+# The full current column set (base + provenance). The read path fills any of
+# these absent from an older DB with ``None`` instead of migrating the file.
+RECORD_COLUMNS: tuple[str, ...] = _BASE_COLUMNS + tuple(_ADDED_COLUMNS)
+
+
+def open_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open a run DB read-only for the export/corpus read paths.
+
+    Unlike :class:`Repository`, this never migrates or writes, so reading an
+    archived run leaves its bytes (and any recorded fixity) untouched and works on
+    read-only media. Callers must tolerate columns absent from an older schema by
+    defaulting them to ``None`` (see :data:`RECORD_COLUMNS`).
+    """
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 class Repository:
     """Thin data-access layer over the run's SQLite database.
 
@@ -119,7 +166,11 @@ class Repository:
         for name, decl in _ADDED_COLUMNS.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE record ADD COLUMN {name} {decl}")
-        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        # Never down-stamp: a DB written by a future version keeps its higher
+        # user_version, so the "newer than us" signal is not silently erased.
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if current < SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     # -- lifecycle --------------------------------------------------------
     def __enter__(self) -> Repository:
@@ -285,10 +336,6 @@ class Repository:
             """,
             (META_OK, DL_PENDING, DL_ERROR),
         )
-
-    def iter_records(self) -> Iterator[sqlite3.Row]:
-        """Yield every record in id order (the read side for export/corpus)."""
-        yield from self._conn.execute("SELECT * FROM record ORDER BY id")
 
     def taken_filenames(self) -> set[str]:
         """Return the set of filenames already assigned (for collision checks)."""

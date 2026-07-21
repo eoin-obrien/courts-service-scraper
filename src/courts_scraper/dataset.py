@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from courts_scraper.db import Repository
+from courts_scraper.db import RECORD_COLUMNS, open_readonly
 
 
 class RowLike(Protocol):
@@ -148,8 +148,14 @@ def iter_records(run_dir: Path) -> Iterator[tuple[dict[str, object], Derived]]:
     projection. Both are handed to consumers so an exporter writes passthrough and
     derived columns from a single pass.
     """
-    with Repository(run_dir / "judgments.sqlite") as repo:
-        for row in repo.iter_records():
-            # sqlite3.Row iterates VALUES, so pair them with keys() explicitly.
-            raw = dict(zip(row.keys(), row, strict=True))
+    conn = open_readonly(run_dir / "judgments.sqlite")
+    try:
+        for row in conn.execute("SELECT * FROM record ORDER BY id"):
+            # Full expected shape, None-filled, then overlay the columns this DB
+            # actually has -- so an older run reads back with NULL provenance and
+            # no migration (the archive is never mutated).
+            raw: dict[str, object] = dict.fromkeys(RECORD_COLUMNS)
+            raw.update(zip(row.keys(), row, strict=True))
             yield raw, derive(raw)
+    finally:
+        conn.close()

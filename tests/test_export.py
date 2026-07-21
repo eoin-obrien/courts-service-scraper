@@ -164,6 +164,33 @@ def test_neutral_citation_repeats_across_opinions(run_dir, tmp_path):
     assert citations == ["[2026] IESC 36", "[2026] IESC 36"]
 
 
+def test_csv_formula_injection_is_neutralised(run_dir, tmp_path):
+    import sqlite3
+
+    conn = sqlite3.connect(run_dir / "judgments.sqlite")
+    conn.execute(
+        "UPDATE record SET title = ? WHERE document_uuid = 'd1'",
+        ('=HYPERLINK("http://evil")',),
+    )
+    conn.commit()
+    conn.close()
+
+    out = tmp_path / "export"
+    export_run(run_dir, out, formats=("csv",))
+    rows = _read_csv(out / "judgments.csv")
+    d1 = {r[0]: dict(zip(_FIELD_NAMES, r, strict=True)) for r in rows[1:]}["d1"]
+    # Leading '=' neutralised so a spreadsheet renders it as text, not a formula.
+    assert d1["title"].startswith("'=")
+
+
+def test_descriptor_references_the_written_format(run_dir, tmp_path):
+    out = tmp_path / "export"
+    export_run(run_dir, out, formats=("json",))  # no CSV written
+    pkg = json.loads((out / "datapackage.json").read_text(encoding="utf-8"))
+    assert pkg["resources"][0]["path"] == "judgments.json"
+    assert not (out / "judgments.csv").exists()  # descriptor must not point at it
+
+
 def test_unknown_format_raises(run_dir, tmp_path):
     with pytest.raises(ExportError, match="unknown export format"):
         export_run(run_dir, tmp_path / "out", formats=("csv", "xlsx"))
