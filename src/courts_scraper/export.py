@@ -287,15 +287,22 @@ def _manifest(run_dir: Path) -> dict[str, object]:
 
 
 def build_datapackage(
-    rows: list[dict[str, object]], run_dir: Path
+    rows: list[dict[str, object]],
+    *,
+    base_url: str | None = None,
+    courts: list[str] | None = None,
+    extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Assemble the ``datapackage.json`` descriptor for the exported rows."""
-    manifest = _manifest(run_dir)
+    """Assemble the ``datapackage.json`` descriptor for the exported rows.
+
+    ``base_url``/``courts`` come from the run manifest (single-run export) or the
+    merge inputs (corpus). ``extra`` merges in extra top-level keys, e.g. a corpus
+    snapshot's source-run set.
+    """
     sources = []
-    base_url = manifest.get("base_url")
-    if isinstance(base_url, str):
+    if base_url:
         sources.append({"title": "Courts Service of Ireland", "path": base_url})
-    return {
+    descriptor: dict[str, object] = {
         "name": "courts-scraper-judgments",
         "title": "Courts Service of Ireland -- written judgments",
         "profile": "tabular-data-package",
@@ -303,7 +310,7 @@ def build_datapackage(
         "tool": {"name": "courts-scraper", "version": __version__},
         "schema_version": SCHEMA_VERSION,
         "derive_version": DERIVE_VERSION,
-        "courts": manifest.get("courts", []),
+        "courts": courts or [],
         "coverage": _coverage(rows),
         "licenses": [
             {
@@ -325,6 +332,9 @@ def build_datapackage(
             }
         ],
     }
+    if extra:
+        descriptor.update(extra)
+    return descriptor
 
 
 def _write_csv(rows: list[dict[str, object]], path: Path) -> None:
@@ -360,13 +370,19 @@ _WRITERS = {
 }
 
 
-def export_run(
-    run_dir: Path, out_dir: Path, formats: Iterable[str] = ("csv", "json")
+def write_package(
+    pairs: Iterable[tuple[RowLike, Derived]],
+    out_dir: Path,
+    *,
+    formats: Iterable[str] = ("csv", "json"),
+    base_url: str | None = None,
+    courts: list[str] | None = None,
+    extra: dict[str, object] | None = None,
 ) -> ExportResult:
-    """Export ``run_dir`` to a Data Package in ``out_dir``.
+    """Write a Data Package into ``out_dir`` from ``(raw, derived)`` pairs.
 
-    Always writes ``datapackage.json``; writes each requested tabular format.
-    A single pass over the derived records feeds every format.
+    The reusable core shared by single-run export and corpus assembly. A single
+    pass over ``pairs`` feeds every requested format, so they cannot drift.
 
     Raises:
         ExportError: For an unknown format, or Parquet without ``pyarrow``.
@@ -378,7 +394,7 @@ def export_run(
 
     flat: list[dict[str, object]] = []
     nested: list[dict[str, object]] = []
-    for raw, derived in iter_records(run_dir):
+    for raw, derived in pairs:
         flat.append(_flat_row(raw, derived))
         if "json" in requested:
             nested.append(_json_record(raw, derived))
@@ -401,9 +417,36 @@ def export_run(
 
     descriptor = out_dir / "datapackage.json"
     descriptor.write_text(
-        json.dumps(build_datapackage(flat, run_dir), ensure_ascii=False, indent=2),
+        json.dumps(
+            build_datapackage(flat, base_url=base_url, courts=courts, extra=extra),
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     written.append(descriptor)
 
     return ExportResult(files=tuple(written), record_count=len(flat))
+
+
+def export_run(
+    run_dir: Path, out_dir: Path, formats: Iterable[str] = ("csv", "json")
+) -> ExportResult:
+    """Export a single ``run_dir`` to a Data Package in ``out_dir``.
+
+    Reads the run's manifest for source/court metadata, then delegates to
+    :func:`write_package`.
+
+    Raises:
+        ExportError: For an unknown format, or Parquet without ``pyarrow``.
+    """
+    manifest = _manifest(run_dir)
+    base_url = manifest.get("base_url")
+    courts = manifest.get("courts")
+    return write_package(
+        iter_records(run_dir),
+        out_dir,
+        formats=formats,
+        base_url=base_url if isinstance(base_url, str) else None,
+        courts=courts if isinstance(courts, list) else None,
+    )

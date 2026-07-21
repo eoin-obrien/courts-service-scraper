@@ -140,13 +140,16 @@ def _as_str(value: object) -> str | None:
     return text or None
 
 
-def iter_records(run_dir: Path) -> Iterator[tuple[RowLike, Derived]]:
+def iter_records(run_dir: Path) -> Iterator[tuple[dict[str, object], Derived]]:
     """Open a run's DB (migrating on open) and yield ``(raw_row, derived)`` pairs.
 
-    The raw row is the source of truth; the derived object is the projection.
-    Both are handed to consumers so an exporter can write passthrough columns and
+    The raw row is materialised to a plain dict so it outlives the DB connection
+    (the corpus merge holds rows across several runs). The derived object is the
+    projection. Both are handed to consumers so an exporter writes passthrough and
     derived columns from a single pass.
     """
     with Repository(run_dir / "judgments.sqlite") as repo:
         for row in repo.iter_records():
-            yield row, derive(row)
+            # sqlite3.Row iterates VALUES, so pair them with keys() explicitly.
+            raw = dict(zip(row.keys(), row, strict=True))
+            yield raw, derive(raw)
