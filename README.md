@@ -64,6 +64,24 @@ uv run courts-scraper status --run-dir data/<timestamp>__supreme
 Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
 `--max-pages` and `--limit` (sampling for testing), `--court` (repeatable).
 
+### Choosing courts and confirming
+
+Scraping is deliberately not eager:
+
+- **No `--court`?** You get a checkbox multiselect to pick courts (Supreme Court
+  pre-selected). Pass `--court` one or more times to skip the prompt.
+- **Before any crawl** the tool shows the scale (result count, page count,
+  estimated time at the current politeness settings) and asks you to confirm.
+
+For unattended runs (cron, CI, scripts) pass `--yes` to skip the confirmation:
+
+```bash
+uv run courts-scraper run --court supreme --yes
+```
+
+In a non-interactive session, the tool never hangs on a prompt: it requires
+`--court` and `--yes` explicitly and errors clearly if either is missing.
+
 ### Cancel and resume
 
 Press **Ctrl-C once** to stop cleanly. In-flight downloads are written to a

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import signal
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from courts_scraper.download import (
     download_pdf,
     sweep_partials,
 )
-from courts_scraper.http import Fetcher, make_client
+from courts_scraper.http import Fetcher, build_client
 from courts_scraper.models import ListRow, RunConfig
 from courts_scraper.naming import MissingCitationError, pdf_filename
 from courts_scraper.parse_list import (
@@ -66,6 +67,45 @@ def _slugify_courts(courts: tuple[Court, ...]) -> str:
     return "-".join(c.name.lower() for c in courts)
 
 
+def build_run_config(
+    *,
+    data_dir: Path,
+    courts: tuple[Court, ...],
+    base_url: str = DEFAULT_BASE_URL,
+    delay: float,
+    jitter: float,
+    max_attempts: int,
+    timeout: float,
+    user_agent: str,
+) -> RunConfig:
+    """Build a :class:`RunConfig` for a fresh run without touching the disk.
+
+    The folder name is ``<UTC timestamp>__<court-slug>`` so runs sort
+    chronologically and are self-describing. Call :func:`materialize_run` to
+    actually create the directories and manifest (done only after the user has
+    confirmed, so a declined run leaves no empty folder behind).
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = data_dir / f"{stamp}__{_slugify_courts(courts)}"
+    return RunConfig(
+        run_dir=run_dir,
+        base_url=base_url,
+        query=build_query(courts),
+        courts=tuple(c.value for c in courts),
+        delay=delay,
+        jitter=jitter,
+        max_attempts=max_attempts,
+        timeout=timeout,
+        user_agent=user_agent,
+    )
+
+
+def materialize_run(config: RunConfig) -> None:
+    """Create the run's directories and write its manifest to disk."""
+    _prepare_dirs(config)
+    _write_manifest(config)
+
+
 def new_run_config(
     *,
     data_dir: Path,
@@ -77,26 +117,18 @@ def new_run_config(
     timeout: float,
     user_agent: str,
 ) -> RunConfig:
-    """Create a fresh run folder and its :class:`RunConfig`, writing a manifest.
-
-    The folder name is ``<UTC timestamp>__<court-slug>`` so runs sort
-    chronologically and are self-describing.
-    """
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = data_dir / f"{stamp}__{_slugify_courts(courts)}"
-    config = RunConfig(
-        run_dir=run_dir,
+    """Build a run config and immediately create its folder and manifest."""
+    config = build_run_config(
+        data_dir=data_dir,
+        courts=courts,
         base_url=base_url,
-        query=build_query(courts),
-        courts=tuple(c.value for c in courts),
         delay=delay,
         jitter=jitter,
         max_attempts=max_attempts,
         timeout=timeout,
         user_agent=user_agent,
     )
-    _prepare_dirs(config)
-    _write_manifest(config)
+    materialize_run(config)
     return config
 
 
@@ -164,8 +196,48 @@ def _write_manifest(config: RunConfig) -> None:
 # ---------------------------------------------------------------------------
 def open_fetcher(config: RunConfig) -> Fetcher:
     """Build a rate-limited :class:`Fetcher` from a run configuration."""
-    limiter = RateLimiter(config.delay, config.jitter)
-    return Fetcher(make_client(config), limiter, config.max_attempts)
+    return build_fetcher(
+        delay=config.delay,
+        jitter=config.jitter,
+        max_attempts=config.max_attempts,
+        timeout=config.timeout,
+        user_agent=config.user_agent,
+    )
+
+
+def build_fetcher(
+    *,
+    delay: float,
+    jitter: float,
+    max_attempts: int,
+    timeout: float,
+    user_agent: str,
+) -> Fetcher:
+    """Build a :class:`Fetcher` from explicit settings, without a run folder.
+
+    Used to fetch the first search page for the pre-scrape confirmation before
+    any run directory is created.
+    """
+    limiter = RateLimiter(delay, jitter)
+    client = build_client(user_agent=user_agent, timeout=timeout)
+    return Fetcher(client, limiter, max_attempts)
+
+
+def format_duration(seconds: float) -> str:
+    """Render a rough duration as ``"45s"``, ``"12m"``, or ``"1h 5m"``."""
+    total = max(0, round(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m" if secs < 30 else f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def estimate_seconds(requests: int, *, delay: float, jitter: float) -> float:
+    """Estimate wall-clock seconds for ``requests`` polite requests."""
+    return requests * (delay + jitter / 2)
 
 
 def install_cancel_handler() -> CancelToken:
@@ -207,31 +279,37 @@ def _progress(console: Console) -> Progress:
 # ---------------------------------------------------------------------------
 # Phase 1: listing
 # ---------------------------------------------------------------------------
-def run_listing(
-    config: RunConfig,
-    fetcher: Fetcher,
-    repo: Repository,
-    *,
-    max_pages: int | None = None,
-    console: Console | None = None,
-) -> int:
-    """Populate the database from the paginated search results.
+@dataclass(frozen=True)
+class ListingPreview:
+    """The parsed first search page plus the shape of the full crawl.
 
-    Args:
-        config: The run configuration.
-        fetcher: HTTP facade.
-        repo: Open repository.
-        max_pages: Optional cap on pages fetched (useful for testing/sampling).
-        console: Rich console for progress output.
-
-    Returns:
-        The number of rows recorded across all fetched pages.
+    Built before the pre-scrape confirmation so the user can see the scale
+    (result count, page count) before committing to the whole crawl.
     """
-    console = console or Console()
+
+    first_html: str
+    first_rows: list[ListRow]
+    total_results: int | None
+    last_page: int  # zero-based, already capped by max_pages
+
+    @property
+    def total_pages(self) -> int:
+        """Number of pages that will be fetched (1-based count)."""
+        return self.last_page + 1
+
+
+def preview_listing(
+    config: RunConfig, fetcher: Fetcher, *, max_pages: int | None = None
+) -> ListingPreview:
+    """Fetch and parse the first search page to learn the crawl's scale.
+
+    Raises:
+        ListingError: If the page has no rows and no result count -- a sign the
+            site's HTML structure has changed.
+    """
     from courts_scraper.query import search_url
 
-    first_url = search_url(config.base_url, config.query, page=0)
-    html = fetcher.get_text(first_url)
+    html = fetcher.get_text(search_url(config.base_url, config.query, page=0))
     first_rows = parse_search_page(html, config.base_url, page=0)
     total_results = parse_result_count(html)
 
@@ -255,16 +333,43 @@ def run_listing(
     if max_pages is not None:
         last_page = min(last_page, max_pages - 1)
 
+    return ListingPreview(html, first_rows, total_results, last_page)
+
+
+def run_listing(
+    config: RunConfig,
+    fetcher: Fetcher,
+    repo: Repository,
+    *,
+    preview: ListingPreview,
+    console: Console | None = None,
+) -> int:
+    """Populate the database from the paginated search results.
+
+    Args:
+        config: The run configuration.
+        fetcher: HTTP facade.
+        repo: Open repository.
+        preview: The already-fetched first page (from :func:`preview_listing`);
+            its first page is reused rather than re-fetched.
+        console: Rich console for progress output.
+
+    Returns:
+        The number of rows recorded across all fetched pages.
+    """
+    console = console or Console()
+    from courts_scraper.query import search_url
+
     console.print(
-        f"Search reports [bold]{total_results or '?'}[/] results "
-        f"across pages 0..{last_page}."
+        f"Search reports [bold]{preview.total_results or '?'}[/] results "
+        f"across pages 0..{preview.last_page}."
     )
 
-    recorded = _record_rows(first_rows, repo)
+    recorded = _record_rows(preview.first_rows, repo)
     with _progress(console) as progress:
-        task = progress.add_task("Listing pages", total=last_page + 1)
+        task = progress.add_task("Listing pages", total=preview.total_pages)
         progress.advance(task)
-        for page in range(1, last_page + 1):
+        for page in range(1, preview.last_page + 1):
             page_html = fetcher.get_text(
                 search_url(config.base_url, config.query, page=page)
             )

@@ -7,8 +7,11 @@ Commands:
 * ``run``      -- convenience: ``list`` then ``download`` in one invocation.
 * ``status``   -- print progress counts for an existing run folder.
 
-All network commands are polite by default (5s spacing, single worker) and
-fully resumable. Press Ctrl-C once to stop cleanly without corrupting data.
+Scraping commands are deliberately not eager: if ``--court`` is omitted you are
+prompted to pick courts, and every scrape shows its scale and asks for
+confirmation first. Pass ``--yes`` to skip the confirmation for unattended runs.
+All network commands are polite by default (5s spacing, single worker) and fully
+resumable. Press Ctrl-C once to stop cleanly without corrupting data.
 """
 
 from __future__ import annotations
@@ -20,15 +23,22 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from courts_scraper import __version__
+from courts_scraper import __version__, prompts
 from courts_scraper.db import Repository
+from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
 from courts_scraper.query import Court
 from courts_scraper.run import (
+    ListingError,
+    ListingPreview,
+    build_run_config,
+    estimate_seconds,
+    format_duration,
     install_cancel_handler,
     load_run_config,
-    new_run_config,
+    materialize_run,
     open_fetcher,
+    preview_listing,
     run_downloads,
     run_listing,
     run_metadata,
@@ -71,7 +81,8 @@ CourtOption = Annotated[
     typer.Option(
         "--court",
         "-c",
-        help="Court to include (repeatable): supreme, court_of_appeal, high.",
+        help="Court to include (repeatable): supreme, court_of_appeal, high. "
+        "If omitted, you are prompted to choose.",
     ),
 ]
 DataDirOption = Annotated[
@@ -98,15 +109,69 @@ AttemptsOption = Annotated[
 TimeoutOption = Annotated[
     float, typer.Option("--timeout", help="Per-request timeout in seconds.")
 ]
+YesOption = Annotated[
+    bool,
+    typer.Option(
+        "--yes", "-y", help="Skip the confirmation prompt (for unattended runs)."
+    ),
+]
 
 
 def _resolve_courts(tokens: list[str]) -> tuple[Court, ...]:
-    if not tokens:
-        return (Court.SUPREME,)
     try:
         return tuple(Court.from_token(t) for t in tokens)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _courts_or_prompt(tokens: list[str]) -> tuple[Court, ...]:
+    """Resolve explicit ``--court`` tokens, or prompt with a multiselect."""
+    return _resolve_courts(tokens) if tokens else prompts.select_courts()
+
+
+def _preview_or_exit(
+    config: RunConfig, max_pages: int | None
+) -> tuple[ListingPreview, Fetcher]:
+    """Fetch the first page for the confirmation, exiting cleanly on drift."""
+    fetcher = open_fetcher(config)
+    try:
+        preview = preview_listing(config, fetcher, max_pages=max_pages)
+    except ListingError as exc:
+        console.print(f"[red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    return preview, fetcher
+
+
+def _print_politeness(
+    config: RunConfig, est_seconds: float, *, upper_bound: bool
+) -> None:
+    prefix = "up to ~" if upper_bound else "~"
+    console.print(
+        f"Politeness: {config.delay:g}s + {config.jitter:g}s jitter  "
+        f"->  {prefix}{format_duration(est_seconds)}."
+    )
+
+
+def _confirm_new_scrape(
+    config: RunConfig, preview: ListingPreview, *, include_downloads: bool, yes: bool
+) -> None:
+    """Show the scale of a fresh crawl and confirm before creating the run."""
+    count = preview.total_results
+    known = count if count is not None else len(preview.first_rows)
+    requests = preview.total_pages + (2 * known if include_downloads else 0)
+    scale = f"{count:,}" if count is not None else "an unknown number of"
+    scope = "list + download" if include_downloads else "list only"
+    console.print(
+        f"[bold]{', '.join(config.courts)}[/]: {scale} results "
+        f"across {preview.total_pages} pages ({scope})."
+    )
+    _print_politeness(
+        config,
+        estimate_seconds(requests, delay=config.delay, jitter=config.jitter),
+        upper_bound=include_downloads,
+    )
+    console.print(f"Run folder: [bold]{config.run_dir}[/]")
+    prompts.confirm_proceed(assume_yes=yes)
 
 
 @app.command("list")
@@ -118,50 +183,21 @@ def list_cmd(
     max_pages: MaxPagesOption = None,
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
+    yes: YesOption = False,
 ) -> None:
     """Start a new run and record the paginated search results."""
-    courts = _resolve_courts(court)
-    config = new_run_config(
-        data_dir=data_dir,
-        courts=courts,
-        delay=delay,
-        jitter=jitter,
-        max_attempts=max_attempts,
-        timeout=timeout,
-        user_agent=DEFAULT_USER_AGENT,
-    )
-    console.print(f"Run folder: [bold]{config.run_dir}[/]")
-    fetcher = open_fetcher(config)
+    config = _build_config(court, data_dir, delay, jitter, max_attempts, timeout)
+    preview, fetcher = _preview_or_exit(config, max_pages)
+    _confirm_new_scrape(config, preview, include_downloads=False, yes=yes)
+
+    materialize_run(config)
     with Repository(config.db_path) as repo:
-        recorded = run_listing(
-            config, fetcher, repo, max_pages=max_pages, console=console
-        )
+        recorded = run_listing(config, fetcher, repo, preview=preview, console=console)
     console.print(
         f"Recorded [bold]{recorded}[/] rows. "
         f"Resume downloads with:\n  courts-scraper download "
         f"--run-dir {config.run_dir}"
     )
-
-
-@app.command("download")
-def download_cmd(
-    run_dir: RunDirOption,
-    delay: DelayOption = 5.0,
-    jitter: JitterOption = 2.0,
-    limit: LimitOption = None,
-    max_attempts: AttemptsOption = 4,
-    timeout: TimeoutOption = 60.0,
-) -> None:
-    """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
-    config = _load(run_dir, delay, jitter, max_attempts, timeout)
-    cancel = install_cancel_handler()
-    fetcher = open_fetcher(config)
-    with Repository(config.db_path) as repo:
-        run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=console)
-        run_downloads(
-            config, fetcher, repo, cancel=cancel, limit=limit, console=console
-        )
-    _print_status(config)
 
 
 @app.command("run")
@@ -174,23 +210,62 @@ def run_cmd(
     limit: LimitOption = None,
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
+    yes: YesOption = False,
 ) -> None:
     """Run both phases: list the results, then download every PDF."""
-    courts = _resolve_courts(court)
-    config = new_run_config(
-        data_dir=data_dir,
-        courts=courts,
-        delay=delay,
-        jitter=jitter,
-        max_attempts=max_attempts,
-        timeout=timeout,
-        user_agent=DEFAULT_USER_AGENT,
-    )
-    console.print(f"Run folder: [bold]{config.run_dir}[/]")
+    config = _build_config(court, data_dir, delay, jitter, max_attempts, timeout)
+    preview, fetcher = _preview_or_exit(config, max_pages)
+    _confirm_new_scrape(config, preview, include_downloads=True, yes=yes)
+
+    materialize_run(config)
     cancel = install_cancel_handler()
-    fetcher = open_fetcher(config)
     with Repository(config.db_path) as repo:
-        run_listing(config, fetcher, repo, max_pages=max_pages, console=console)
+        run_listing(config, fetcher, repo, preview=preview, console=console)
+        run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=console)
+        run_downloads(
+            config, fetcher, repo, cancel=cancel, limit=limit, console=console
+        )
+    _print_status(config)
+
+
+@app.command("download")
+def download_cmd(
+    run_dir: RunDirOption,
+    delay: DelayOption = 5.0,
+    jitter: JitterOption = 2.0,
+    limit: LimitOption = None,
+    max_attempts: AttemptsOption = 4,
+    timeout: TimeoutOption = 60.0,
+    yes: YesOption = False,
+) -> None:
+    """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
+    config = _load(run_dir, delay, jitter, max_attempts, timeout)
+    with Repository(config.db_path) as repo:
+        counts = repo.counts()
+        remaining = counts["total"] - counts["download_done"]
+        if remaining <= 0:
+            console.print("Nothing left to do -- all downloads complete.")
+            _print_status(config)
+            return
+        est_requests = (
+            counts["meta_pending"]
+            + counts["download_pending"]
+            + counts["download_error"]
+        )
+        console.print(f"Resuming [bold]{config.run_dir.name}[/].")
+        console.print(
+            f"{remaining:,} judgment(s) left to process "
+            f"({counts['download_done']:,} already done)."
+        )
+        _print_politeness(
+            config,
+            estimate_seconds(est_requests, delay=config.delay, jitter=config.jitter),
+            upper_bound=True,
+        )
+        prompts.confirm_proceed(assume_yes=yes)
+
+        cancel = install_cancel_handler()
+        fetcher = open_fetcher(config)
         run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=console)
         run_downloads(
             config, fetcher, repo, cancel=cancel, limit=limit, console=console
@@ -203,6 +278,26 @@ def status_cmd(run_dir: RunDirOption) -> None:
     """Print progress counts for an existing run folder."""
     config = _load(run_dir, 5.0, 2.0, 4, 60.0)
     _print_status(config)
+
+
+def _build_config(
+    court: list[str],
+    data_dir: Path,
+    delay: float,
+    jitter: float,
+    max_attempts: int,
+    timeout: float,
+) -> RunConfig:
+    courts = _courts_or_prompt(court)
+    return build_run_config(
+        data_dir=data_dir,
+        courts=courts,
+        delay=delay,
+        jitter=jitter,
+        max_attempts=max_attempts,
+        timeout=timeout,
+        user_agent=DEFAULT_USER_AGENT,
+    )
 
 
 def _load(

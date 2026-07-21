@@ -37,9 +37,14 @@ def is_retryable(exc: BaseException) -> bool:
 
 def make_client(config: RunConfig) -> httpx.Client:
     """Create an :class:`httpx.Client` configured for the run."""
+    return build_client(user_agent=config.user_agent, timeout=config.timeout)
+
+
+def build_client(*, user_agent: str, timeout: float) -> httpx.Client:
+    """Create an :class:`httpx.Client` from explicit settings (no run folder)."""
     return httpx.Client(
-        headers={"User-Agent": config.user_agent},
-        timeout=config.timeout,
+        headers={"User-Agent": user_agent},
+        timeout=timeout,
         follow_redirects=True,
     )
 
