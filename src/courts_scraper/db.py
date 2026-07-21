@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 
@@ -31,6 +32,10 @@ META_ERROR = "error"
 DL_PENDING = "pending"
 DL_DONE = "done"
 DL_ERROR = "error"
+
+# Schema version, stamped in the DB via ``PRAGMA user_version``. Bump whenever a
+# column is added below so a reader can tell a migrated DB from a fresh one.
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS record (
@@ -63,6 +68,28 @@ CREATE INDEX IF NOT EXISTS idx_download_status ON record(download_status);
 CREATE INDEX IF NOT EXISTS idx_collection      ON record(collection_uuid);
 """
 
+# Columns added after the v1 schema above. They live ONLY here -- not in the
+# CREATE TABLE -- so a single migrate-on-open path brings both a fresh DB and an
+# old run's DB to the current shape. Names are trusted constants (never user
+# input), so interpolating them into ``ALTER TABLE`` is safe. Provenance is
+# captured per observation phase: ``listed_at`` (search row seen),
+# ``meta_retrieved_at`` (view page scraped), ``pdf_retrieved_at`` (binary
+# fetched + verified), plus the PDF response's caching/type headers.
+_ADDED_COLUMNS: dict[str, str] = {
+    "listed_at": "TEXT",
+    "meta_retrieved_at": "TEXT",
+    "pdf_retrieved_at": "TEXT",
+    "http_last_modified": "TEXT",
+    "http_etag": "TEXT",
+    "http_content_length": "INTEGER",
+    "http_content_type": "TEXT",
+}
+
+
+def _utcnow_iso() -> str:
+    """Return the current time as a UTC ISO 8601 string (per-record provenance)."""
+    return datetime.now(UTC).isoformat()
+
 
 class Repository:
     """Thin data-access layer over the run's SQLite database.
@@ -77,7 +104,22 @@ class Repository:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring the ``record`` table up to :data:`SCHEMA_VERSION` in place.
+
+        Idempotent: adds any column from :data:`_ADDED_COLUMNS` that a DB created
+        by an older version is missing (backfilled ``NULL``), then stamps
+        ``user_version``. Runs on every open, so an archived run folder keeps
+        working without a re-scrape, and a fresh DB reaches the same shape.
+        """
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(record)")}
+        for name, decl in _ADDED_COLUMNS.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE record ADD COLUMN {name} {decl}")
+        self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     # -- lifecycle --------------------------------------------------------
     def __enter__(self) -> Repository:
@@ -107,8 +149,8 @@ class Repository:
             """
             INSERT INTO record (
                 page, title, court, judge, date_delivered, date_uploaded,
-                view_url, pdf_url, collection_uuid, document_uuid
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                view_url, pdf_url, collection_uuid, document_uuid, listed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pdf_url) DO NOTHING
             """,
             (
@@ -122,6 +164,9 @@ class Repository:
                 row.pdf_url,
                 row.collection_uuid,
                 row.document_uuid,
+                # First-seen time. ON CONFLICT DO NOTHING means a re-listing keeps
+                # the original ``listed_at`` rather than resetting it.
+                _utcnow_iso(),
             ),
         )
         self._conn.commit()
@@ -136,7 +181,7 @@ class Repository:
             UPDATE record SET
                 neutral_citation = ?, record_number = ?, status_field = ?,
                 result = ?, composition = ?, meta_json = ?, filename = ?,
-                meta_status = ?, error_reason = NULL
+                meta_status = ?, meta_retrieved_at = ?, error_reason = NULL
             WHERE id = ?
             """,
             (
@@ -148,6 +193,7 @@ class Repository:
                 json.dumps(_meta_to_json(meta), ensure_ascii=False),
                 filename,
                 META_OK,
+                _utcnow_iso(),
                 record_id,
             ),
         )
@@ -173,15 +219,44 @@ class Repository:
         self._conn.commit()
 
     # -- phase 2: download ------------------------------------------------
-    def record_download(self, record_id: int, sha256: str, size: int) -> None:
-        """Mark a record's PDF as successfully downloaded and verified."""
+    def record_download(
+        self,
+        record_id: int,
+        sha256: str,
+        size: int,
+        *,
+        last_modified: str | None = None,
+        etag: str | None = None,
+        content_length: int | None = None,
+        content_type: str | None = None,
+    ) -> None:
+        """Mark a record's PDF as downloaded and verified, with fetch provenance.
+
+        ``sha256``/``size`` are the verified digest and on-disk byte count. The
+        keyword args carry the PDF response's caching/type headers as served, for
+        provenance; any the server omits are stored ``NULL``. ``pdf_retrieved_at``
+        is stamped now.
+        """
         self._conn.execute(
             """
             UPDATE record SET
-                sha256 = ?, bytes = ?, download_status = ?, error_reason = NULL
+                sha256 = ?, bytes = ?, download_status = ?,
+                pdf_retrieved_at = ?, http_last_modified = ?, http_etag = ?,
+                http_content_length = ?, http_content_type = ?,
+                error_reason = NULL
             WHERE id = ?
             """,
-            (sha256, size, DL_DONE, record_id),
+            (
+                sha256,
+                size,
+                DL_DONE,
+                _utcnow_iso(),
+                last_modified,
+                etag,
+                content_length,
+                content_type,
+                record_id,
+            ),
         )
         self._conn.commit()
 

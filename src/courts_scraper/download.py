@@ -22,6 +22,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 from tenacity import (
     retry,
@@ -52,10 +53,20 @@ class DownloadIncomplete(Exception):
 
 @dataclass(frozen=True, slots=True)
 class DownloadResult:
-    """Outcome of a successful download."""
+    """Outcome of a successful download.
+
+    ``sha256``/``size`` are the verified digest and on-disk byte count. The
+    remaining fields are the response's caching/type headers as served, kept for
+    provenance; any the server omits are ``None`` (this site usually omits
+    ``Content-Length`` for these downloads -- see :data:`_PDF_MAGIC`).
+    """
 
     sha256: str
     size: int
+    last_modified: str | None = None
+    etag: str | None = None
+    content_length: int | None = None
+    content_type: str | None = None
 
 
 class CancelToken:
@@ -154,6 +165,7 @@ def _download_once(
     try:
         with fetcher.stream(url) as response, part.open("wb") as handle:
             expected = _comparable_content_length(response)
+            provenance = _response_provenance(response)
             for chunk in response.iter_bytes(_CHUNK):
                 if cancel.cancelled:
                     raise DownloadCancelled(url)
@@ -178,7 +190,7 @@ def _download_once(
     # fsync the directory so the rename itself is durable, not just the bytes.
     part.replace(target)
     _fsync_dir(target.parent)
-    return DownloadResult(sha256=digest.hexdigest(), size=size)
+    return DownloadResult(sha256=digest.hexdigest(), size=size, **provenance)
 
 
 def _verify_body(url: str, *, size: int, header: bytes, expected: int | None) -> None:
@@ -212,6 +224,31 @@ def _fsync_dir(directory: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+class _Provenance(TypedDict):
+    """Header-derived provenance fields, shaped to splat into DownloadResult."""
+
+    last_modified: str | None
+    etag: str | None
+    content_length: int | None
+    content_type: str | None
+
+
+def _response_provenance(response: object) -> _Provenance:
+    """Extract caching/type headers from the PDF response for provenance.
+
+    ``content_length`` is the raw ``Content-Length`` header (independent of the
+    decompression caveat in :func:`_comparable_content_length`); any header the
+    server omits comes back ``None``.
+    """
+    headers = getattr(response, "headers", {})
+    return {
+        "last_modified": headers.get("last-modified"),
+        "etag": headers.get("etag"),
+        "content_length": _content_length(response),
+        "content_type": headers.get("content-type"),
+    }
 
 
 def _comparable_content_length(response: object) -> int | None:
