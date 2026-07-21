@@ -86,6 +86,27 @@ def test_cancellation_leaves_no_file(httpx_mock, tmp_path):
     assert not (tmp_path / "out.pdf.part").exists()
 
 
+def test_read_timeout_is_retried_then_succeeds(httpx_mock, tmp_path):
+    # ReadTimeout is an httpx.TimeoutException -> retryable with backoff.
+    data = b"%PDF-1.7 recovered after timeout"
+    httpx_mock.add_exception(httpx.ReadTimeout("timed out"), url=URL)
+    httpx_mock.add_response(url=URL, content=data)
+    target = tmp_path / "out.pdf"
+
+    result = download_pdf(_fetcher(), URL, target, cancel=CancelToken())
+
+    assert target.read_bytes() == data
+    assert result.size == len(data)
+
+
+def test_get_text_retries_read_timeout(httpx_mock):
+    url = "https://ww2.courts.ie/search/Judgments/x"
+    httpx_mock.add_exception(httpx.ReadTimeout("timed out"), url=url)
+    httpx_mock.add_response(url=url, text="recovered")
+
+    assert _fetcher().get_text(url) == "recovered"
+
+
 def test_transient_error_is_retried_then_succeeds(httpx_mock, tmp_path):
     data = b"%PDF-1.7 recovered body"
     httpx_mock.add_response(url=URL, status_code=503)
