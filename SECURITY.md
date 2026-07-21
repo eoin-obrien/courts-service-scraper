@@ -6,7 +6,7 @@ If you discover a security issue in `courts-scraper` (for example, a way the
 download or file-naming logic could be abused to write outside the data folder),
 please report it privately rather than opening a public issue.
 
-- Email: **eoinobrien910@gmail.com**
+- Email: **eoin@eoin.ai**
 - Please include steps to reproduce and, if possible, a minimal example.
 
 You can expect an acknowledgement within a few days. Once a fix is available it
