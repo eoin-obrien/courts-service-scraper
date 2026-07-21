@@ -576,4 +576,12 @@ def _download_row(
         cancel=cancel,
         max_attempts=config.max_attempts,
     )
-    repo.record_download(row["id"], result.sha256, result.size)
+    repo.record_download(
+        row["id"],
+        result.sha256,
+        result.size,
+        last_modified=result.last_modified,
+        etag=result.etag,
+        content_length=result.content_length,
+        content_type=result.content_type,
+    )

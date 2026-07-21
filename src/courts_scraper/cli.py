@@ -24,7 +24,9 @@ from rich.console import Console
 from rich.table import Table
 
 from courts_scraper import __version__, prompts
+from courts_scraper.corpus import build_corpus
 from courts_scraper.db import Repository
+from courts_scraper.export import ExportError, data_dictionary_markdown, export_run
 from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
 from courts_scraper.query import Court
@@ -338,6 +340,100 @@ def runs_cmd(data_dir: DataDirOption = Path("data")) -> None:
             str(run.error) if run.readable else "-",
         )
     console.print(table)
+
+
+@app.command("export")
+def export_cmd(
+    run_dir: RunDirOption = None,
+    data_dir: DataDirOption = Path("data"),
+    latest: LatestOption = False,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Output folder (default: <run>/export)."),
+    ] = None,
+    fmt: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Comma-separated formats: csv, json, parquet.",
+        ),
+    ] = "csv,json",
+) -> None:
+    """Export a run to a Frictionless Data Package (CSV + JSON + optional Parquet)."""
+    resolved = _resolve_run_dir(run_dir, data_dir, latest)
+    out_dir = out if out is not None else resolved / "export"
+    formats = [token.strip() for token in fmt.split(",") if token.strip()]
+    if not formats:
+        raise typer.BadParameter("--format must name at least one format.")
+    try:
+        result = export_run(resolved, out_dir, formats)
+    except (ExportError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        f"Exported [bold]{result.record_count}[/] records to [bold]{out_dir}[/]:"
+    )
+    for path in result.files:
+        console.print(f"  {path.name}")
+
+
+@app.command("data-dictionary")
+def data_dictionary_cmd(
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Write to this file instead of stdout."),
+    ] = None,
+) -> None:
+    """Print (or write) the export data dictionary, generated from the schema."""
+    markdown = data_dictionary_markdown()
+    if out is not None:
+        out.write_text(markdown, encoding="utf-8")
+        console.print(f"Wrote data dictionary to [bold]{out}[/].")
+    else:
+        # Plain stdout so it can be piped to a file; bypass Rich markup.
+        print(markdown, end="")
+
+
+@app.command("corpus")
+def corpus_cmd(
+    data_dir: DataDirOption = Path("data"),
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Output bag folder (default: <data-dir>/corpus)."),
+    ] = None,
+    fmt: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Comma-separated: csv, json, parquet."),
+    ] = "csv,json",
+) -> None:
+    """Merge all runs into one citable BagIt corpus (dedup + fixity + datasheet)."""
+    run_dirs = [run.path for run in list_runs(data_dir) if run.readable]
+    if not run_dirs:
+        raise typer.BadParameter(f"no readable runs under {data_dir}.")
+    out_dir = out if out is not None else data_dir / "corpus"
+    formats = [token.strip() for token in fmt.split(",") if token.strip()]
+    if not formats:
+        raise typer.BadParameter("--format must name at least one format.")
+    try:
+        result = build_corpus(run_dirs, out_dir, formats=formats)
+    except (ExportError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    console.print(
+        f"Corpus: [bold]{result.record_count}[/] records from "
+        f"{len(run_dirs)} run(s) -> [bold]{out_dir}[/]."
+    )
+    if result.conflicts:
+        console.print(
+            f"[yellow]{len(result.conflicts)} content conflict(s)[/] "
+            f"(same document, differing PDF) -- see data/snapshot.json."
+        )
+    if result.missing_pdfs:
+        console.print(
+            f"[yellow]{len(result.missing_pdfs)} PDF(s) missing[/] on disk "
+            f"and omitted from the bag."
+        )
+    console.print("Verify fixity with any BagIt tool (manifest-sha256.txt).")
 
 
 def _resolve_run_dir(run_dir: Path | None, data_dir: Path, latest: bool) -> Path:

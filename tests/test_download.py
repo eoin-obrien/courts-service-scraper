@@ -50,6 +50,39 @@ def test_happy_path_writes_verified_file(httpx_mock, tmp_path):
     assert not (tmp_path / "out.pdf.part").exists()
 
 
+def test_captures_response_provenance_headers(httpx_mock, tmp_path):
+    data = b"%PDF-1.7 fake body"
+    httpx_mock.add_response(
+        url=URL,
+        content=data,
+        headers={
+            "last-modified": "Wed, 02 Jul 2026 09:00:00 GMT",
+            "etag": '"abc123"',
+            "content-type": "application/pdf",
+        },
+    )
+    target = tmp_path / "out.pdf"
+
+    result = download_pdf(_fetcher(), URL, target, cancel=CancelToken())
+
+    assert result.last_modified == "Wed, 02 Jul 2026 09:00:00 GMT"
+    assert result.etag == '"abc123"'
+    assert result.content_type == "application/pdf"
+    # httpx sets Content-Length on a fixed-body mock response.
+    assert result.content_length == len(data)
+
+
+def test_provenance_headers_absent_are_none(httpx_mock, tmp_path):
+    # The real site usually omits these; missing headers must be None, not error.
+    httpx_mock.add_response(url=URL, content=b"%PDF-1.7 body")
+    target = tmp_path / "out.pdf"
+
+    result = download_pdf(_fetcher(), URL, target, cancel=CancelToken())
+
+    assert result.last_modified is None
+    assert result.etag is None
+
+
 def test_empty_body_rejected(httpx_mock, tmp_path):
     httpx_mock.add_response(url=URL, content=b"")
     target = tmp_path / "out.pdf"

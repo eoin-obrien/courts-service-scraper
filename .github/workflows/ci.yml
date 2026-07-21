@@ -32,7 +32,9 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync --extra dev --python ${{ matrix.python-version }}
+        # parquet extra so the Parquet writer path and the Frictionless
+        # descriptor validation (dev extra) both run in CI.
+        run: uv sync --extra dev --extra parquet --python ${{ matrix.python-version }}
 
       - name: Ruff format
         run: uv run ruff format --check .
