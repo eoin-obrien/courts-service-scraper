@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Ruff](https://img.shields.io/badge/lint-ruff-000000)](https://github.com/astral-sh/ruff)
 [![Checked with mypy](https://img.shields.io/badge/mypy-strict-2a6db2)](https://mypy-lang.org/)
+[![DOI](https://zenodo.org/badge/1307155551.svg)](https://doi.org/10.5281/zenodo.21465515)
 
 A research tool that archives written judgments published by the
 **Courts Service of Ireland** at [`ww2.courts.ie`](https://ww2.courts.ie).
@@ -150,18 +151,18 @@ or supported by the Courts Service of Ireland.**
 
 ## Citing
 
-If you use `courts-scraper` in research, please cite it. On GitHub, use the
-**"Cite this repository"** button (top right, powered by
-[`CITATION.cff`](CITATION.cff)) to get a formatted citation, or cite it directly:
+If you use `courts-scraper` in research, please cite it. Every release is
+archived on [Zenodo](https://doi.org/10.5281/zenodo.21465515) with a DOI, and
+GitHub's **"Cite this repository"** button (powered by
+[`CITATION.cff`](CITATION.cff)) produces a formatted citation.
 
 > O'Brien, E. (2026). *courts-scraper: a research scraper for Courts Service of
-> Ireland judgments* (Version 0.1.0) [Computer software].
-> https://github.com/eoin-obrien/courts-service-scraper
+> Ireland judgments* (Version 0.1.0) [Computer software]. Zenodo.
+> https://doi.org/10.5281/zenodo.21465515
 
-To mint a permanent, versioned DOI, archive a release on
-[Zenodo](https://zenodo.org/): enable the repository in Zenodo's GitHub
-settings, publish a GitHub Release, and add the resulting DOI badge here and the
-`doi:` field to `CITATION.cff`.
+The DOI [`10.5281/zenodo.21465515`](https://doi.org/10.5281/zenodo.21465515)
+always resolves to the latest release; each individual release also has its own
+version-specific DOI on its Zenodo record.
 
 ## License
 
