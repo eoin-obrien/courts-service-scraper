@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -426,8 +427,39 @@ def run_metadata(
             if cancel.cancelled:
                 console.print("[yellow]Cancelled during metadata phase.[/]")
                 break
-            _resolve_metadata(config, fetcher, repo, row, console)
+            _resolve_one(config, fetcher, repo, row, console)
             progress.advance(task)
+
+
+def _resolve_one(
+    config: RunConfig,
+    fetcher: Fetcher,
+    repo: Repository,
+    row: sqlite3.Row,
+    console: Console,
+) -> None:
+    """Resolve one row's metadata, keeping the run alive on any failure.
+
+    A network failure (e.g. a ``ReadTimeout`` that outlived its retries) leaves
+    the row ``pending`` so it is retried on the next run; an unexpected error is
+    recorded so it is not retried forever. Either way the crawl continues instead
+    of crashing.
+    """
+    try:
+        _resolve_metadata(config, fetcher, repo, row, console)
+    except httpx.HTTPError as exc:
+        _append_error(
+            config,
+            "metadata_fetch_failed",
+            f"{row['title']} | {row['view_url']} | {type(exc).__name__}: {exc}",
+        )
+        console.print(
+            f"[red]Metadata fetch failed[/] (will retry on resume): {row['title']}"
+        )
+    except Exception as exc:  # unexpected -- record and continue, never crash
+        repo.record_meta_error(row["id"], f"{type(exc).__name__}: {exc}")
+        _append_error(config, "metadata_error", f"{row['title']} | {row['view_url']}")
+        console.print(f"[red]Metadata error:[/] {row['title']} (skipped)")
 
 
 def _resolve_metadata(

@@ -123,6 +123,57 @@ def test_download_rejects_tampered_filename(tmp_path):
     assert not (config.pdf_dir / "evil.pdf").exists()
 
 
+def test_metadata_fetch_failure_does_not_crash_run(tmp_path):
+    """A ReadTimeout that outlives retries leaves the row pending, not a crash."""
+    import httpx
+
+    from courts_scraper.db import Repository
+    from courts_scraper.download import CancelToken
+    from courts_scraper.models import ListRow
+    from courts_scraper.run import materialize_run, run_metadata
+
+    config = build_run_config(
+        data_dir=tmp_path,
+        courts=(Court.SUPREME,),
+        delay=0.0,
+        jitter=0.0,
+        max_attempts=1,
+        timeout=10.0,
+        user_agent="test",
+    )
+    materialize_run(config)
+
+    class _AlwaysTimeout:
+        def get_text(self, url: str) -> str:
+            raise httpx.ReadTimeout("read timed out")
+
+    with Repository(config.db_path) as repo:
+        repo.upsert_listing(
+            ListRow(
+                page=0,
+                title="X -v- Y",
+                court="Supreme Court",
+                judge="J",
+                date_delivered=None,
+                date_uploaded=None,
+                view_url="https://ww2.courts.ie/view/x",
+                pdf_url="https://ww2.courts.ie/acc/alfresco/x/a.pdf",
+                collection_uuid="c",
+                document_uuid="d",
+            )
+        )
+        # Must not raise, even though every fetch times out.
+        run_metadata(config, _AlwaysTimeout(), repo, cancel=CancelToken())
+        counts = repo.counts()
+
+    # The row stays pending (retryable on resume) -- not done, not errored.
+    assert counts["meta_pending"] == 1
+    assert counts["meta_ok"] == 0
+    assert counts["meta_error"] == 0
+    # The failure is recorded durably for follow-up.
+    assert "metadata_fetch_failed" in config.error_log_path.read_text(encoding="utf-8")
+
+
 def test_build_run_config_does_not_touch_disk(tmp_path):
     config = build_run_config(
         data_dir=tmp_path,
