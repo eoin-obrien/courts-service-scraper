@@ -1,0 +1,52 @@
+name: Bug report
+description: Report something that does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please do not paste large
+        volumes of scraped content; a minimal example is far more useful.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        Command run:
+          courts-scraper download --run-dir data/...
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or error log
+      description: >-
+        Paste the terminal output or the contents of the run's logs/errors.log.
+        This is automatically formatted as code.
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `courts-scraper --version` or the commit SHA."
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: "Output of `python --version`."
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "e.g. Ubuntu 24.04, macOS 15, Windows 11 (WSL2)"
+    validations:
+      required: true
