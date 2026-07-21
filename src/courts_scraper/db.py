@@ -133,6 +133,10 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
     read-only media. Callers must tolerate columns absent from an older schema by
     defaulting them to ``None`` (see :data:`RECORD_COLUMNS`).
     """
+    if not db_path.exists():
+        # mode=ro cannot create a DB, so surface a clear error instead of a raw
+        # sqlite OperationalError for a missing/pruned run folder.
+        raise FileNotFoundError(f"no database at {db_path}")
     conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn

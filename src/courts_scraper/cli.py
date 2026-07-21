@@ -368,7 +368,7 @@ def export_cmd(
         raise typer.BadParameter("--format must name at least one format.")
     try:
         result = export_run(resolved, out_dir, formats)
-    except ExportError as exc:
+    except (ExportError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(
         f"Exported [bold]{result.record_count}[/] records to [bold]{out_dir}[/]:"
@@ -416,7 +416,7 @@ def corpus_cmd(
         raise typer.BadParameter("--format must name at least one format.")
     try:
         result = build_corpus(run_dirs, out_dir, formats=formats)
-    except ExportError as exc:
+    except (ExportError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     console.print(

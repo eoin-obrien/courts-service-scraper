@@ -91,6 +91,37 @@ def test_seed_vocab_matches_observed_values():
 
 
 # -- iter over a real run DB ----------------------------------------------
+def test_iter_records_missing_db_raises_clean_error(tmp_path):
+    import pytest
+
+    # A run folder with no judgments.sqlite must not leak a raw sqlite error.
+    with pytest.raises(FileNotFoundError):
+        list(iter_records(tmp_path))
+
+
+def test_iter_records_reads_committed_wal_rows(tmp_path):
+    # Repository writes in WAL mode; the read-only reader must see committed rows
+    # after close (the common, checkpointed case).
+    with Repository(tmp_path / "judgments.sqlite") as repo:
+        repo.upsert_listing(
+            ListRow(
+                page=0,
+                title="X",
+                court="Supreme Court",
+                judge="Woulfe J.",
+                date_delivered="2026-07-02",
+                date_uploaded="2026-07-02",
+                view_url="https://x/v",
+                pdf_url="https://x/a.pdf",
+                collection_uuid="c1",
+                document_uuid="d1",
+            )
+        )
+    pairs = list(iter_records(tmp_path))
+    assert len(pairs) == 1
+    assert pairs[0][0]["document_uuid"] == "d1"
+
+
 def test_iter_records_does_not_mutate_the_source_db(tmp_path):
     import hashlib
 
