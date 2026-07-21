@@ -1,6 +1,6 @@
 # Data dictionary
 
-Generated from the export Table Schema (`EXPORT_FIELDS`). Do not edit by hand; regenerate with `courts-scraper data-dictionary`.
+Generated from the export Table Schema (`EXPORT_FIELDS`). Do not edit by hand; regenerate with `courts-scraper dictionary`.
 
 Primary key: `document_uuid`. Missing values are the empty string.
 

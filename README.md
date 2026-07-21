@@ -49,29 +49,32 @@ uv sync --extra dev      # create the environment and install dependencies
 ## Usage
 
 ```bash
-# List Supreme Court results into a new run folder under ./data
-uv run courts-scraper list --court supreme
+# Crawl Supreme Court judgments into a new run folder under ./data (list + download)
+uv run courts-scraper fetch --court supreme
+
+# Just record the search results, no PDFs yet (the old `list`)
+uv run courts-scraper fetch --court supreme --list-only
+
+# Resume a run -- "resume" is just running fetch again
+uv run courts-scraper fetch                    # interactive: start new OR pick a run
+uv run courts-scraper fetch --latest           # resume the newest run, no prompt
+uv run courts-scraper fetch --run-dir data/<timestamp>__supreme
 
 # See existing runs and their progress
 uv run courts-scraper runs
-
-# Resume a run (pick it interactively, or name it, or take the newest)
-uv run courts-scraper download            # prompts you to choose a run
-uv run courts-scraper download --latest   # newest run, no prompt
-uv run courts-scraper download --run-dir data/<timestamp>__supreme
-
-# Or do both phases at once
-uv run courts-scraper run --court supreme
+uv run courts-scraper runs --json              # machine-readable
 
 # Keep a canonical run current: fetch only newly-published judgments
 uv run courts-scraper update --latest
 uv run courts-scraper update --run-dir data/<timestamp>__supreme --yes
+uv run courts-scraper update --latest --json   # {new, revisions, errors, run}
 
 # Also re-check already-downloaded PDFs for server-side changes (costly, opt-in)
 uv run courts-scraper update --latest --revalidate --yes
 
 # Check progress at any time
-uv run courts-scraper status              # also picks a run if not given
+uv run courts-scraper status                   # also picks a run if not given
+uv run courts-scraper status --latest --json   # counts as JSON
 
 # Export one run to a Frictionless Data Package (CSV + JSON + optional Parquet)
 uv run courts-scraper export --latest --format csv,json,parquet
@@ -80,20 +83,31 @@ uv run courts-scraper export --latest --format csv,json,parquet
 uv run courts-scraper corpus --out data/corpus
 
 # Print the column data dictionary (generated from the schema)
-uv run courts-scraper data-dictionary
+uv run courts-scraper dictionary
 ```
 
-Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
-`--max-pages` and `--limit` (sampling for testing), `--court` (repeatable),
-`--user-agent` (override the request User-Agent), `--yes` (skip confirmation),
-`--latest` (resume the newest run unattended), `--revalidate` (on `update`, also
-re-fetch downloaded PDFs to detect and version server-side changes).
+`--data-dir` is a **global** option (default `./data`, or `COURTS_SCRAPER_DATA`).
+Being global it must come *before* the subcommand:
+`uv run courts-scraper --data-dir ./mydata runs` (not after it).
 
-`download` vs `update`: `download` **finishes** an in-progress crawl (resolve
-metadata and fetch PDFs for rows still pending). `update` **maintains a complete
-run** over time -- it re-lists the run's fixed search so only genuinely-new
-judgments become pending, then fetches just those. Use `download` to complete a
-run; use `update` to keep it current.
+Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
+`--max-pages` and `--limit` (sampling for testing), `--court`/`-c` (repeatable),
+`--list-only` (record results without downloading), `--user-agent` (override the
+request User-Agent), `--yes` (skip confirmation), `--latest` (act on the newest
+run unattended), `--json` (machine-readable output on `status`/`runs`/`export`/
+`corpus`/`update`), `--revalidate` (on `update`, also re-fetch downloaded PDFs to
+detect and version server-side changes).
+
+`fetch` vs `update`: `fetch` **starts or finishes** a crawl -- it creates a new run
+(with `--court`) or resumes an incomplete one (with `--run-dir`/`--latest`),
+resolving metadata and fetching PDFs for rows still pending. `update` **maintains a
+complete run** over time -- it re-lists the run's fixed search so only genuinely-new
+judgments become pending, then fetches just those. Use `fetch` to create or complete
+a run; use `update` to keep it current. `fetch --court` refuses to re-crawl a run
+that is already complete and points you at `update`.
+
+Exit codes: `0` success (including a clean first-Ctrl-C stop), `1` outage/error,
+`2` bad usage, `130` a second Ctrl-C, `143` SIGTERM.
 
 ### Choosing courts and confirming
 
@@ -107,7 +121,7 @@ Scraping is deliberately not eager:
 For unattended runs (cron, CI, scripts) pass `--yes` to skip the confirmation:
 
 ```bash
-uv run courts-scraper run --court supreme --yes
+uv run courts-scraper fetch --court supreme --yes
 ```
 
 In a non-interactive session, the tool never hangs on a prompt: it requires
@@ -116,21 +130,22 @@ In a non-interactive session, the tool never hangs on a prompt: it requires
 ### Discovering and resuming runs
 
 `courts-scraper runs` lists every run under the data directory with its progress
-(`done/total`, errors). To resume, `download`/`status` accept a run three ways:
+(`done/total`, errors). To resume, `fetch`/`status`/`update`/`export` accept a run
+three ways:
 
 - `--run-dir <folder>` names it explicitly;
 - `--latest` takes the newest run without prompting (good for scripts);
 - with neither, an interactive picker lists your runs (newest first) to choose.
 
 In a non-interactive session the picker never hangs: it errors and tells you to
-pass `--run-dir` or `--latest`.
+pass `--run-dir` or `--latest` (or `--court` to start a new run).
 
 ### Cancel and resume
 
 Press **Ctrl-C once** to stop cleanly. In-flight downloads are written to a
 `.part` file and only atomically renamed to their final name once complete and
 verified, so cancelling never leaves a half-file that a later run would mistake
-for a finished download. Re-run `download` to resume exactly where you stopped.
+for a finished download. Re-run `fetch --latest` to resume exactly where you stopped.
 
 Network errors (timeouts like `ReadTimeout`, connection drops, `429`/`5xx`) are
 retried automatically with exponential backoff (tune with `--max-attempts`). If
@@ -148,7 +163,7 @@ court-selection** and `update` it on a schedule:
 
 ```bash
 # One-time: create the canonical run.
-uv run courts-scraper run --court supreme --yes
+uv run courts-scraper fetch --court supreme --yes
 
 # Then, on a cadence (cron), fetch only what is new. Use a higher --delay for a
 # scheduled job -- incremental fetch means most runs touch very little.

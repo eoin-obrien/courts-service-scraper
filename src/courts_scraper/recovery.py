@@ -110,6 +110,6 @@ class OutageBreaker:
                 return True
         self._console.print(
             "[red]Site still down after the outage cap; stopping. "
-            "Resume later with `courts-scraper download --latest`.[/]"
+            "Resume later with `courts-scraper fetch --latest`.[/]"
         )
         return False

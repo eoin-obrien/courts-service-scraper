@@ -69,7 +69,8 @@ def select_run(runs: list[RunInfo]) -> RunInfo:
     """
     if not runs:
         raise typer.BadParameter(
-            "no existing runs found; start one with `courts-scraper list` or `run`."
+            "no existing runs found; start one with "
+            "`courts-scraper fetch --court supreme`."
         )
     if not is_interactive():
         raise typer.BadParameter(
@@ -85,6 +86,49 @@ def select_run(runs: list[RunInfo]) -> RunInfo:
     if selected is None:  # Ctrl-C
         raise typer.Abort()
     return selected
+
+
+_START_NEW = "__start_new__"
+
+
+def select_new_or_run(runs: list[RunInfo]) -> RunInfo | None:
+    """Interactive front door: start a new run (``None``) or resume an existing one.
+
+    Args:
+        runs: Resumable (incomplete) runs, newest first.
+
+    Returns:
+        ``None`` to start a new run, or the chosen :class:`RunInfo` to resume.
+
+    Raises:
+        typer.Abort: If the user cancels.
+    """
+    choices = [questionary.Choice(title="Start a new run", value=_START_NEW)]
+    choices += [questionary.Choice(title=run.summary, value=run) for run in runs]
+    selected = questionary.select(
+        "Start a new run, or resume one?", choices=choices
+    ).ask()
+    if selected is None:  # Ctrl-C
+        raise typer.Abort()
+    return None if selected == _START_NEW else selected
+
+
+def confirm_resume_existing(run: RunInfo) -> bool:
+    """Ask whether to resume a matching incomplete run instead of starting new.
+
+    Returns:
+        True to resume the existing run, False to start a fresh one.
+
+    Raises:
+        typer.Abort: If the user cancels.
+    """
+    answer = questionary.confirm(
+        f"An incomplete run for these courts exists ({run.summary}). Resume it?",
+        default=True,
+    ).ask()
+    if answer is None:  # Ctrl-C
+        raise typer.Abort()
+    return bool(answer)
 
 
 def confirm_proceed(*, assume_yes: bool) -> None:

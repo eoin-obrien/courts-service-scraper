@@ -36,6 +36,20 @@ class RunInfo:
         """Whether every listed PDF has been downloaded."""
         return self.readable and self.total > 0 and self.done >= self.total
 
+    def to_dict(self) -> dict[str, object]:
+        """A JSON-serialisable view for ``runs --json``."""
+        return {
+            "name": self.name,
+            "courts": list(self.courts),
+            "created": self.created,
+            "total": self.total,
+            "done": self.done,
+            "error": self.error,
+            "readable": self.readable,
+            "complete": self.is_complete,
+            "path": str(self.path),
+        }
+
     @property
     def summary(self) -> str:
         """A one-line human summary used in the picker and listings."""
