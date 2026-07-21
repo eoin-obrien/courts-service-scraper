@@ -88,3 +88,47 @@ def test_resolve_run_dir_latest(make_run_dir, tmp_path):
     make_run_dir(data, "20260101T000000Z__supreme")
     newer = make_run_dir(data, "20260202T000000Z__supreme")
     assert _resolve_run_dir(None, data, latest=True) == newer
+
+
+def _plain(lines):
+    return re.sub(r"\[/?[^\]]*\]", "", " ".join(lines))
+
+
+def test_resume_summary_shows_metadata_progress():
+    from courts_scraper.cli import _resume_summary
+
+    # 918 metadata resolved, nothing downloaded yet -- the old bug reported this
+    # as "0 already done".
+    counts = {
+        "total": 2561,
+        "meta_ok": 918,
+        "meta_pending": 1643,
+        "meta_error": 0,
+        "download_done": 0,
+        "download_pending": 2561,
+        "download_error": 0,
+    }
+    complete, lines = _resume_summary(counts)
+    text = _plain(lines)
+
+    assert not complete
+    assert "918/2,561 resolved" in text
+    assert "1,643 to fetch" in text
+    assert "0/918 PDFs done" in text
+
+
+def test_resume_summary_complete_when_all_done():
+    from courts_scraper.cli import _resume_summary
+
+    counts = {
+        "total": 100,
+        "meta_ok": 100,
+        "meta_pending": 0,
+        "meta_error": 0,
+        "download_done": 100,
+        "download_pending": 0,
+        "download_error": 0,
+    }
+    complete, lines = _resume_summary(counts)
+    assert complete
+    assert "complete" in _plain(lines)

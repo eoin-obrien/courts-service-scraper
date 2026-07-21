@@ -275,20 +275,17 @@ def download_cmd(
     config = _load(resolved, delay, jitter, max_attempts, timeout, user_agent)
     with Repository(config.db_path) as repo:
         counts = repo.counts()
-        remaining = counts["total"] - counts["download_done"]
-        if remaining <= 0:
-            console.print("Nothing left to do -- all downloads complete.")
+        complete, lines = _resume_summary(counts)
+        console.print(f"Resuming [bold]{config.run_dir.name}[/].")
+        for line in lines:
+            console.print(line)
+        if complete:
             _print_status(config)
             return
         est_requests = (
             counts["meta_pending"]
             + counts["download_pending"]
             + counts["download_error"]
-        )
-        console.print(f"Resuming [bold]{config.run_dir.name}[/].")
-        console.print(
-            f"{remaining:,} judgment(s) left to process "
-            f"({counts['download_done']:,} already done)."
         )
         _print_politeness(
             config,
@@ -353,6 +350,42 @@ def _resolve_run_dir(run_dir: Path | None, data_dir: Path, latest: bool) -> Path
             raise typer.BadParameter(f"no runs found under {data_dir}.")
         return runs[0].path
     return prompts.select_run(list_runs(data_dir)).path
+
+
+def _resume_summary(counts: dict[str, int]) -> tuple[bool, list[str]]:
+    """Summarise a resumed run's progress across both phases.
+
+    Returns ``(complete, lines)``. ``complete`` is True only when there is no
+    metadata left to fetch and every resolvable PDF has been downloaded -- so a
+    run that has resolved metadata but downloaded nothing is *not* reported as
+    "nothing to do" (the previous bug that hid metadata progress).
+    """
+    total, meta_ok, meta_pending, meta_error, dl_done, dl_error = (
+        counts["total"],
+        counts["meta_ok"],
+        counts["meta_pending"],
+        counts["meta_error"],
+        counts["download_done"],
+        counts["download_error"],
+    )
+
+    if meta_pending == 0 and dl_done >= meta_ok:
+        return True, ["Nothing left to do -- this run is complete."]
+
+    meta_extras = []
+    if meta_pending:
+        meta_extras.append(f"{meta_pending:,} to fetch")
+    if meta_error:
+        meta_extras.append(f"{meta_error:,} skipped")
+    meta_line = f"Metadata:  [bold]{meta_ok:,}[/]/{total:,} resolved"
+    if meta_extras:
+        meta_line += f" ({', '.join(meta_extras)})"
+
+    dl_line = f"Downloads: [bold]{dl_done:,}[/]/{meta_ok:,} PDFs done"
+    if dl_error:
+        dl_line += f" ({dl_error:,} to retry)"
+
+    return False, [meta_line + ".", dl_line + "."]
 
 
 def _build_config(
