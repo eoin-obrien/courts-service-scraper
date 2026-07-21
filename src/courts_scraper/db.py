@@ -175,12 +175,21 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def read_pdf_versions(db_path: Path) -> list[sqlite3.Row]:
-    """Read a run's full ``pdf_version`` history read-only, for the corpus snapshot.
+def iter_pdf_versions(db_path: Path) -> Iterator[sqlite3.Row]:
+    """Stream a run's ``pdf_version`` history read-only, oldest-first per record.
 
-    Returns an empty list when the run predates the history table (older schema),
-    so the corpus reader can treat "no history" and "no changes" uniformly without
-    migrating the archived run. Rows are ordered oldest-first per record.
+    Yields rows in ``(record_id, fetched_at, id)`` order -- so the corpus reader can
+    group a record's versions on the fly (its rows are contiguous) without pulling
+    the whole table into RAM. Tolerates the same edges as a full read: a run that
+    predates the history table (older schema) yields nothing, and a corrupt/locked
+    DB is treated as "no history" -- an optional audit trail must never abort a
+    corpus build. The connection stays open for the life of the iterator and is
+    closed when it is exhausted or garbage-collected.
+
+    Raises:
+        FileNotFoundError: If no database exists at ``db_path`` (via
+            :func:`open_readonly`), surfaced lazily on first iteration; corpus
+            callers treat that as "no history", matching the missing-run case.
     """
     conn = open_readonly(db_path)
     try:
@@ -188,16 +197,36 @@ def read_pdf_versions(db_path: Path) -> list[sqlite3.Row]:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdf_version'"
         ).fetchone()
         if not has_table:
-            return []
-        return conn.execute(
+            return
+        cursor = conn.execute(
             "SELECT * FROM pdf_version ORDER BY record_id, fetched_at, id"
-        ).fetchall()
+        )
+        # Corruption can surface lazily as pages are read, not only at execute(),
+        # so tolerate a mid-stream DatabaseError and stop -- same "no history"
+        # outcome as the whole-table reader, without losing the streaming property.
+        while True:
+            try:
+                row = cursor.fetchone()
+            except sqlite3.DatabaseError:
+                return
+            if row is None:
+                return
+            yield row
     except sqlite3.DatabaseError:
-        # A corrupt/locked run DB must not abort a whole corpus build over the
-        # optional revision history; treat it as "no history" (the missing-DB case).
-        return []
+        return
     finally:
         conn.close()
+
+
+def read_pdf_versions(db_path: Path) -> list[sqlite3.Row]:
+    """Materialise a run's full ``pdf_version`` history read-only, oldest-first.
+
+    A thin wrapper over :func:`iter_pdf_versions` for callers that want the whole
+    (small, single-run) history in hand; the corpus build path streams instead.
+    Returns an empty list when the run predates the history table or its DB is
+    corrupt, so "no history" and "no changes" read uniformly.
+    """
+    return list(iter_pdf_versions(db_path))
 
 
 class Repository:

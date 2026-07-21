@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from courts_scraper import corpus
 from courts_scraper.corpus import build_corpus, merge_runs
 from courts_scraper.db import Repository
 from courts_scraper.export import ExportError
@@ -251,3 +252,194 @@ def test_rebuild_cleans_stale_payload(tmp_path):
 def test_empty_run_list_raises(tmp_path):
     with pytest.raises(ExportError, match="no runs"):
         build_corpus([], tmp_path / "bag")
+
+
+# -- revision aggregation: streaming + bounded build ----------------------
+def _insert_versions(
+    run_dir, record_id, shas, *, uuid="d1", pdf_url="https://x/d1.pdf"
+):
+    """Insert a chain of pdf_version rows for one record (oldest->newest).
+
+    Every row but the last is superseded and points at ``versions/<sha>.pdf``;
+    consecutive pairs are the revisions ``_collect_revisions`` derives.
+    """
+    conn = sqlite3.connect(run_dir / "judgments.sqlite")
+    last = len(shas) - 1
+    for i, sha in enumerate(shas):
+        superseded = None if i == last else f"2026-01-01T00:00:{i:02d}+00:00"
+        filename = "live.pdf" if i == last else f"versions/{sha}.pdf"
+        conn.execute(
+            """
+            INSERT INTO pdf_version (
+                record_id, document_uuid, pdf_url, neutral_citation, filename,
+                sha256, bytes, fetched_at, superseded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                uuid,
+                pdf_url,
+                "[2026] IESC 36",
+                filename,
+                sha,
+                10,
+                f"2026-01-01T00:00:{i:02d}+00:00",
+                superseded,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_revision_build_is_bounded_but_count_is_true(tmp_path, monkeypatch):
+    # Six versions of one document -> five distinct revisions. With the embed cap
+    # lowered to three, the build must hold at most three entry dicts while still
+    # counting all five: the cap bounds the *build*, not just serialization.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa")
+    _insert_versions(r1, 1, ["s0", "s1", "s2", "s3", "s4", "s5"])
+    monkeypatch.setattr(corpus, "_MAX_SNAPSHOT_REVISIONS", 3)
+
+    scan = corpus._collect_revisions([r1])
+
+    assert scan.total == 5  # true count, not the sample size
+    assert len(scan.entries) == 3  # never accumulated past the cap
+
+
+def test_revision_scan_streams_via_iterator(tmp_path, monkeypatch):
+    # The aggregation must read through the streaming reader (not a materialised
+    # whole-table fetch), and still cap the embedded sample below the true total.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa")
+    _insert_versions(r1, 1, ["s0", "s1", "s2", "s3"])
+    monkeypatch.setattr(corpus, "_MAX_SNAPSHOT_REVISIONS", 2)
+
+    real_iter = corpus.iter_pdf_versions
+    used = {"streamed": False}
+
+    def spy(db_path):
+        used["streamed"] = True
+        yield from real_iter(db_path)
+
+    monkeypatch.setattr(corpus, "iter_pdf_versions", spy)
+
+    scan = corpus._collect_revisions([r1])
+
+    assert used["streamed"]  # went through the streaming iterator
+    assert scan.total == 3
+    assert len(scan.entries) == 2
+
+
+def test_snapshot_revisions_count_and_truncation(tmp_path, monkeypatch):
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa")
+    _insert_versions(r1, 1, ["s0", "s1", "s2", "s3"])
+    monkeypatch.setattr(corpus, "_MAX_SNAPSHOT_REVISIONS", 2)
+    bag = tmp_path / "bag"
+
+    build_corpus([r1], bag, formats=("csv",))
+
+    snap = json.loads((bag / "data" / "snapshot.json").read_text(encoding="utf-8"))
+    assert snap["revisions"]["count"] == 3  # authoritative total
+    assert len(snap["revisions"]["entries"]) == 2  # bounded sample
+    assert snap["revisions"]["truncated"] is True
+
+
+# -- version archive: only referenced, verified copies --------------------
+def _archive_superseded(
+    run_dir, record_id, *, old_bytes, archive_bytes=None, write=True
+):
+    """Record a superseded version and (optionally) place its archived file.
+
+    Returns the content-addressed name ``<old_sha>.pdf``. Pass ``archive_bytes``
+    that differ from ``old_bytes`` to simulate a corrupt archive; ``write=False``
+    leaves the reference dangling (referenced but missing on disk).
+    """
+    old_sha = hashlib.sha256(old_bytes).hexdigest()
+    _insert_versions(run_dir, record_id, [old_sha, "newlive"])
+    if write:
+        vdir = run_dir / "pdfs" / "versions"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / f"{old_sha}.pdf").write_bytes(
+            archive_bytes if archive_bytes is not None else old_bytes
+        )
+    return f"{old_sha}.pdf"
+
+
+def test_referenced_verified_version_is_bagged(tmp_path):
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    name = _archive_superseded(r1, 1, old_bytes=b"%PDF-1.7 old bytes")
+    bag = tmp_path / "bag"
+
+    result = build_corpus([r1], bag, formats=("csv",))
+
+    bagged = bag / "data" / "pdfs" / "versions" / name
+    assert bagged.read_bytes() == b"%PDF-1.7 old bytes"
+    assert result.unverified_versions == ()
+    # It rides BagIt fixity like any payload file.
+    manifest = (bag / "manifest-sha256.txt").read_text(encoding="utf-8")
+    assert f"data/pdfs/versions/{name}" in manifest
+
+
+def test_orphan_version_file_is_not_bagged(tmp_path):
+    # A versions/*.pdf with no superseded row referencing it is noise -> excluded.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    vdir = r1 / "pdfs" / "versions"
+    vdir.mkdir(parents=True, exist_ok=True)
+    orphan_bytes = b"%PDF-1.7 orphan"
+    orphan = f"{hashlib.sha256(orphan_bytes).hexdigest()}.pdf"
+    (vdir / orphan).write_bytes(orphan_bytes)
+    bag = tmp_path / "bag"
+
+    result = build_corpus([r1], bag, formats=("csv",))
+
+    assert not (bag / "data" / "pdfs" / "versions" / orphan).exists()
+    assert result.unverified_versions == ()  # unreferenced, so not a gap
+
+
+def test_corrupt_version_file_is_skipped_and_surfaced(tmp_path):
+    # Referenced, but the archived bytes do not hash to the name -> never attested.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    name = _archive_superseded(
+        r1, 1, old_bytes=b"%PDF-1.7 true", archive_bytes=b"%PDF-1.7 corrupt"
+    )
+    bag = tmp_path / "bag"
+
+    result = build_corpus([r1], bag, formats=("csv",))
+
+    assert not (bag / "data" / "pdfs" / "versions" / name).exists()
+    assert result.unverified_versions == (name,)
+
+
+def test_referenced_missing_version_is_surfaced(tmp_path):
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    name = _archive_superseded(r1, 1, old_bytes=b"%PDF-1.7 gone", write=False)
+    bag = tmp_path / "bag"
+
+    result = build_corpus([r1], bag, formats=("csv",))
+
+    assert not (bag / "data" / "pdfs" / "versions" / name).exists()
+    assert result.unverified_versions == (name,)
+
+
+def test_version_read_error_surfaces_not_aborts(tmp_path, monkeypatch):
+    # The archive exists and passes is_file(), but the read raises mid-build (a
+    # concurrent prune / unreadable file). It must surface as a gap and leave the
+    # whole bag build intact -- never propagate out of build_corpus.
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", filename="a.pdf")
+    name = _archive_superseded(r1, 1, old_bytes=b"%PDF-1.7 vanishes")
+    bag = tmp_path / "bag"
+
+    real = corpus.sha256_of
+
+    def flaky(path):
+        if path.name == name:  # only the referenced archive read; manifest still hashes
+            raise FileNotFoundError(path)
+        return real(path)
+
+    monkeypatch.setattr(corpus, "sha256_of", flaky)
+
+    result = build_corpus([r1], bag, formats=("csv",))  # must not raise
+
+    assert result.unverified_versions == (name,)
+    assert not (bag / "data" / "pdfs" / "versions" / name).exists()
+    # The rest of the bag is still whole and fixity-valid.
+    assert (bag / "manifest-sha256.txt").exists()
+    assert (bag / "data" / "pdfs" / "a.pdf").exists()
