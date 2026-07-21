@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+title: "courts-scraper: a research scraper for Courts Service of Ireland judgments"
+abstract: >-
+  A command-line tool that archives written judgments published by the Courts
+  Service of Ireland (ww2.courts.ie). It builds a queryable SQLite database of
+  judgment metadata and downloads the judgment PDFs into a self-contained,
+  resumable, checksum-verified data folder.
+type: software
+authors:
+  - given-names: Eoin
+    family-names: O'Brien
+    orcid: "https://orcid.org/0000-0002-0171-9434"
+version: 0.1.0
+date-released: "2026-07-21"
+license: MIT
+repository-code: "https://github.com/eoin-obrien/courts-service-scraper"
+url: "https://github.com/eoin-obrien/courts-service-scraper"
+keywords:
+  - Ireland
+  - courts
+  - judgments
+  - case law
+  - legal informatics
+  - web scraping
+  - research data
