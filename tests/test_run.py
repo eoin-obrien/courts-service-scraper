@@ -147,6 +147,9 @@ def test_metadata_fetch_failure_does_not_crash_run(tmp_path):
         def get_text(self, url: str) -> str:
             raise httpx.ReadTimeout("read timed out")
 
+        def is_up(self, url: str) -> bool:
+            return False
+
     with Repository(config.db_path) as repo:
         repo.upsert_listing(
             ListRow(

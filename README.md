@@ -110,8 +110,12 @@ verified, so cancelling never leaves a half-file that a later run would mistake
 for a finished download. Re-run `download` to resume exactly where you stopped.
 
 Network errors (timeouts like `ReadTimeout`, connection drops, `429`/`5xx`) are
-retried automatically with exponential backoff; tune the attempts with
-`--max-attempts`.
+retried automatically with exponential backoff (tune with `--max-attempts`). If
+the site goes down entirely (it occasionally does for tens of minutes during
+document uploads), the scraper detects the outage after a few consecutive
+failures, **pauses and re-probes on an escalating interval**, and resumes where
+it left off once the site is back, rather than hammering a down server. If the
+outage outlasts an hour it stops cleanly so you can resume later.
 
 ## Data folder layout
 

@@ -131,6 +131,16 @@ def test_sweep_partials_removes_only_part_files(tmp_path):
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_is_up_true_when_server_responds(httpx_mock):
+    httpx_mock.add_response(method="HEAD", url=URL, status_code=200)
+    assert _fetcher().is_up(URL) is True
+
+
+def test_is_up_false_on_connection_error(httpx_mock):
+    httpx_mock.add_exception(httpx.ConnectError("refused"), method="HEAD", url=URL)
+    assert _fetcher().is_up(URL) is False
+
+
 def test_sha256_of(tmp_path):
     path = tmp_path / "f.bin"
     path.write_bytes(b"hello")

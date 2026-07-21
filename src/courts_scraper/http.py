@@ -69,6 +69,19 @@ class Fetcher:
         """Fetch ``url`` and return its body as text, retrying transient errors."""
         return self._retry(self._get_text)(url)
 
+    def is_up(self, url: str) -> bool:
+        """Single, non-retrying liveness probe used to detect site recovery.
+
+        Returns ``True`` if the server responds at all (any status below 500),
+        ``False`` on a connection error, timeout, or 5xx.
+        """
+        self._limiter.wait()
+        try:
+            response = self._client.head(url)
+        except httpx.HTTPError:
+            return False
+        return response.status_code < 500
+
     def _get_text(self, url: str) -> str:
         self._limiter.wait()
         response = self._client.get(url)

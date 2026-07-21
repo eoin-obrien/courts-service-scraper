@@ -18,9 +18,9 @@ import signal
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
-import httpx
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -53,6 +53,7 @@ from courts_scraper.parse_list import (
 from courts_scraper.parse_view import parse_view_page
 from courts_scraper.query import Court, build_query
 from courts_scraper.ratelimit import RateLimiter
+from courts_scraper.recovery import OutageBreaker, Outcome
 
 DEFAULT_BASE_URL = "https://ww2.courts.ie"
 
@@ -421,45 +422,40 @@ def run_metadata(
     if not pending:
         return
 
+    breaker = OutageBreaker(fetcher, config.base_url, console)
     with _progress(console) as progress:
         task = progress.add_task("Fetching metadata", total=len(pending))
         for row in pending:
             if cancel.cancelled:
                 console.print("[yellow]Cancelled during metadata phase.[/]")
                 break
-            _resolve_one(config, fetcher, repo, row, console)
+            try:
+                outcome, exc = breaker.run(
+                    partial(_resolve_metadata, config, fetcher, repo, row, console)
+                )
+            except Exception as err:  # parse/db error -- record and continue
+                repo.record_meta_error(row["id"], f"{type(err).__name__}: {err}")
+                _append_error(
+                    config, "metadata_error", f"{row['title']} | {row['view_url']}"
+                )
+                console.print(f"[red]Metadata error:[/] {row['title']} (skipped)")
+                progress.advance(task)
+                continue
+
+            if outcome is Outcome.GAVE_UP:
+                console.print("[red]Stopping the metadata phase (site down).[/]")
+                break
+            if outcome is Outcome.DEFER:
+                _append_error(
+                    config,
+                    "metadata_fetch_failed",
+                    f"{row['title']} | {row['view_url']} | {exc}",
+                )
+                console.print(
+                    f"[red]Metadata fetch failed[/] (will retry on resume): "
+                    f"{row['title']}"
+                )
             progress.advance(task)
-
-
-def _resolve_one(
-    config: RunConfig,
-    fetcher: Fetcher,
-    repo: Repository,
-    row: sqlite3.Row,
-    console: Console,
-) -> None:
-    """Resolve one row's metadata, keeping the run alive on any failure.
-
-    A network failure (e.g. a ``ReadTimeout`` that outlived its retries) leaves
-    the row ``pending`` so it is retried on the next run; an unexpected error is
-    recorded so it is not retried forever. Either way the crawl continues instead
-    of crashing.
-    """
-    try:
-        _resolve_metadata(config, fetcher, repo, row, console)
-    except httpx.HTTPError as exc:
-        _append_error(
-            config,
-            "metadata_fetch_failed",
-            f"{row['title']} | {row['view_url']} | {type(exc).__name__}: {exc}",
-        )
-        console.print(
-            f"[red]Metadata fetch failed[/] (will retry on resume): {row['title']}"
-        )
-    except Exception as exc:  # unexpected -- record and continue, never crash
-        repo.record_meta_error(row["id"], f"{type(exc).__name__}: {exc}")
-        _append_error(config, "metadata_error", f"{row['title']} | {row['view_url']}")
-        console.print(f"[red]Metadata error:[/] {row['title']} (skipped)")
 
 
 def _resolve_metadata(
@@ -520,6 +516,7 @@ def run_downloads(
         console.print("Nothing to download.")
         return
 
+    breaker = OutageBreaker(fetcher, config.base_url, console)
     with _progress(console) as progress:
         task = progress.add_task("Downloading PDFs", total=len(pending))
         for row in pending:
@@ -527,10 +524,32 @@ def run_downloads(
                 console.print("[yellow]Cancelled -- partial file discarded.[/]")
                 break
             try:
-                _download_row(config, fetcher, repo, row, cancel, console)
+                outcome, exc = breaker.run(
+                    partial(_download_row, config, fetcher, repo, row, cancel)
+                )
             except DownloadCancelled:
                 console.print("[yellow]Cancelled -- partial file discarded.[/]")
                 break
+            except Exception as err:  # e.g. unsafe filename -- record and continue
+                repo.record_download_error(row["id"], f"{type(err).__name__}: {err}")
+                _append_error(
+                    config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
+                )
+                console.print(f"[red]Failed:[/] {row['filename']}")
+                progress.advance(task)
+                continue
+
+            if outcome is Outcome.GAVE_UP:
+                console.print("[red]Stopping the download phase (site down).[/]")
+                break
+            if outcome is Outcome.DEFER:
+                repo.record_download_error(row["id"], f"{exc}")
+                _append_error(
+                    config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
+                )
+                console.print(
+                    f"[red]Download failed[/] (will retry on resume): {row['filename']}"
+                )
             progress.advance(task)
 
 
@@ -540,34 +559,21 @@ def _download_row(
     repo: Repository,
     row: sqlite3.Row,
     cancel: CancelToken,
-    console: Console,
 ) -> None:
-    # Only rows with download_status in (pending, error) reach here (see
-    # ``Repository.iter_pending_downloads``); completed rows are filtered out by
-    # the query, so there is no resume shortcut to apply at this point. A row
-    # whose file exists but is still ``pending`` (crash between publish and DB
-    # commit) has no stored checksum to trust, so it is simply re-downloaded.
-    record_id = row["id"]
+    """Download one row's PDF, recording it on success (raises on failure).
 
-    try:
-        # Verify the stored filename cannot escape the PDF folder before writing
-        # (defence-in-depth against a tampered database row).
-        target = safe_output_path(config.pdf_dir, row["filename"])
-        result = download_pdf(
-            fetcher,
-            row["pdf_url"],
-            target,
-            cancel=cancel,
-            max_attempts=config.max_attempts,
-        )
-    except DownloadCancelled:
-        raise  # handled by the caller as a graceful stop
-    except Exception as exc:  # record and continue the run
-        repo.record_download_error(record_id, f"{type(exc).__name__}: {exc}")
-        _append_error(
-            config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
-        )
-        console.print(f"[red]Failed:[/] {row['filename']}")
-        return
-
-    repo.record_download(record_id, result.sha256, result.size)
+    Only rows with ``download_status`` in (pending, error) reach here; completed
+    rows are filtered out by the query. A row whose file exists but is still
+    ``pending`` (crash between publish and DB commit) has no trusted checksum, so
+    it is simply re-downloaded. The filename is validated to stay inside the PDF
+    folder before any write (defence-in-depth against a tampered database row).
+    """
+    target = safe_output_path(config.pdf_dir, row["filename"])
+    result = download_pdf(
+        fetcher,
+        row["pdf_url"],
+        target,
+        cancel=cancel,
+        max_attempts=config.max_attempts,
+    )
+    repo.record_download(row["id"], result.sha256, result.size)
