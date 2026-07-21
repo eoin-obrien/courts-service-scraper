@@ -599,6 +599,11 @@ def corpus_cmd(
             f"[yellow]{len(result.missing_pdfs)} PDF(s) missing[/] on disk "
             f"and omitted from the bag."
         )
+    if result.unverified_versions:
+        console.print(
+            f"[yellow]{len(result.unverified_versions)} superseded version(s) "
+            f"unverifiable[/] (missing or digest mismatch) and omitted from the bag."
+        )
     console.print("Verify fixity with any BagIt tool (manifest-sha256.txt).")
 
 

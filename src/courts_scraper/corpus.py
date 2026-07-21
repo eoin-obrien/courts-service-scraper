@@ -26,21 +26,23 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from courts_scraper import __version__
 from courts_scraper.dataset import DERIVE_VERSION, Derived, iter_records
-from courts_scraper.db import SCHEMA_VERSION, read_pdf_versions
+from courts_scraper.db import SCHEMA_VERSION, iter_pdf_versions
 from courts_scraper.download import sha256_of
 from courts_scraper.export import EXPORT_FIELDS, ExportError, write_package
 from courts_scraper.naming import UnsafeFilenameError, safe_output_path
 
 _BAGIT_VERSION = "1.0"
 _DL_DONE = "done"
-# Cap on revision entries embedded verbatim in snapshot.json, so a corpus with a
-# very long revision history cannot bloat (or, from a hostile run, OOM) the bag.
-# The full count is always reported; only the embedded list is truncated.
+# Cap on revision entries embedded verbatim in snapshot.json. The cap bounds the
+# *build*, not just the output: :func:`_collect_revisions` stops accumulating
+# entry dicts once it holds this many, while still counting the true total by
+# streaming the ``pdf_version`` history. So a corpus with a very long (or, from a
+# hostile run, adversarial) revision history cannot bloat or OOM the bag -- the
+# embedded list is a bounded, deterministic sample and the count stays authoritative.
 _MAX_SNAPSHOT_REVISIONS = 1000
 
 
@@ -71,6 +73,10 @@ class CorpusResult:
     record_count: int
     conflicts: tuple[Conflict, ...]
     missing_pdfs: tuple[str, ...]
+    # Referenced superseded versions that could not be verified (missing on disk or
+    # whose bytes did not re-hash to their content-addressed name) and so were
+    # omitted from the bag. Surfaced, never silently dropped.
+    unverified_versions: tuple[str, ...] = ()
 
 
 def _identity(raw: dict[str, object]) -> str:
@@ -90,6 +96,21 @@ def _recency_key(raw: dict[str, object]) -> tuple[str, str, str]:
     )
 
 
+# Memory scope call (P1, deliberately deferred). merge_runs holds the whole
+# deduplicated corpus in RAM: one ``best`` entry per surviving document (recency
+# key + raw dict + Derived + run name), plus a ``sha_seen`` map per identity, and
+# write_package then materialises ``flat`` (and, for JSON, ``nested``) lists over
+# the same set. Deduping by identity and emitting a *globally sorted* bag both
+# inherently require holding every surviving identity at once, so a true streamed
+# write would mean spilling the dedup/sort index to disk (a temp SQLite or an
+# external merge sort) -- a corpus-read-side rewrite touching write_package's row
+# buffering. Budget: a ~50k-record corpus is ~150-250 MB peak here (order 3-5 KB
+# per record across best + flat + nested); comfortable on a laptop, tight on a
+# 1 GB single-board machine, and the term grows linearly. Trigger to convert:
+# when a target corpus exceeds ~100k records, or must build on <2 GB RAM. Until
+# then the revision aggregation (below) is the streamed path, since its size is
+# bounded by *content changes*, not corpus size, and a hostile history could
+# otherwise dwarf the corpus itself.
 def merge_runs(run_dirs: Iterable[Path]) -> MergeResult:
     """Merge runs, deduping by document identity and detecting content conflicts."""
     best: dict[str, tuple[tuple[str, str, str], dict[str, object], Derived, str]] = {}
@@ -228,48 +249,78 @@ def _copy_pdfs(
     return copied, missing
 
 
-def _collect_revisions(run_dirs: list[Path]) -> list[dict[str, object]]:
+@dataclass(frozen=True, slots=True)
+class _RevisionScan:
+    """A bounded sample of revision entries plus the true (unbounded) total.
+
+    ``entries`` holds at most :data:`_MAX_SNAPSHOT_REVISIONS` dicts; ``total`` is
+    the count of *distinct* revisions across all runs, whatever the sample size.
+    """
+
+    entries: list[dict[str, object]]
+    total: int
+
+
+def _collect_revisions(run_dirs: list[Path]) -> _RevisionScan:
     """Aggregate per-document PDF version changes across runs for the snapshot.
 
-    Reads each run's append-only ``pdf_version`` history (tolerating older runs
-    with no such table) and, for every document that gained a new version, emits a
-    revision entry pairing the superseded bytes with the ones that replaced them --
-    the audit trail that ``update --revalidate`` records in the single-run model.
+    Streams each run's append-only ``pdf_version`` history (tolerating older runs
+    with no such table) rather than materialising it, and, for every document that
+    gained a new version, emits a revision entry pairing the superseded bytes with
+    the ones that replaced them -- the audit trail that ``update --revalidate``
+    records in the single-run model. History rows arrive ordered by
+    ``(record_id, fetched_at, id)``, so a record's versions are contiguous and can
+    be paired on the fly by holding only the previous row.
+
     Deduplicated across runs by ``(document, old_sha, new_sha)`` so re-merging the
-    same runs is stable, and ordered deterministically for a reproducible snapshot.
+    same runs is stable. Memory is bounded regardless of history size: entry dicts
+    stop accumulating once the sample reaches :data:`_MAX_SNAPSHOT_REVISIONS`,
+    while ``total`` still counts every distinct revision (the ``seen`` set it needs
+    for correct cross-run dedup is O(distinct revisions), i.e. content changes, not
+    corpus size). The kept sample is sorted deterministically for a reproducible
+    snapshot; being capped by scan order it is a stable sample, not the global top-N.
     """
     seen: set[tuple[str, str, str]] = set()
     entries: list[dict[str, object]] = []
+    total = 0
     for run_dir in run_dirs:
+        record_id: int | None = None
+        prev: sqlite3.Row | None = None
         try:
-            versions = read_pdf_versions(run_dir / "judgments.sqlite")
-        except FileNotFoundError:
-            continue
-        by_record: dict[int, list[sqlite3.Row]] = {}
-        for v in versions:
-            by_record.setdefault(int(v["record_id"]), []).append(v)
-        for record_versions in by_record.values():
-            for older, newer in pairwise(record_versions):
+            for v in iter_pdf_versions(run_dir / "judgments.sqlite"):
+                rid = int(v["record_id"])
+                if rid != record_id:
+                    # First row of a new record group: nothing precedes it to
+                    # supersede, so it only seeds ``prev`` for the next pairing.
+                    record_id, prev = rid, v
+                    continue
+                assert prev is not None  # set by the group's first row, above
+                older, newer = prev, v
+                prev = v
                 ident = str(older["document_uuid"] or older["pdf_url"])
                 key = (ident, str(older["sha256"]), str(newer["sha256"]))
                 if key in seen:
                     continue
                 seen.add(key)
-                entries.append(
-                    {
-                        "document_uuid": older["document_uuid"],
-                        "pdf_url": older["pdf_url"],
-                        "neutral_citation": older["neutral_citation"],
-                        "old_sha256": older["sha256"],
-                        "old_bytes": older["bytes"],
-                        "old_fetched_at": older["fetched_at"],
-                        "old_filename": older["filename"],
-                        "new_sha256": newer["sha256"],
-                        "new_bytes": newer["bytes"],
-                        "detected_at": older["superseded_at"],
-                        "run": run_dir.name,
-                    }
-                )
+                total += 1
+                if len(entries) < _MAX_SNAPSHOT_REVISIONS:
+                    entries.append(
+                        {
+                            "document_uuid": older["document_uuid"],
+                            "pdf_url": older["pdf_url"],
+                            "neutral_citation": older["neutral_citation"],
+                            "old_sha256": older["sha256"],
+                            "old_bytes": older["bytes"],
+                            "old_fetched_at": older["fetched_at"],
+                            "old_filename": older["filename"],
+                            "new_sha256": newer["sha256"],
+                            "new_bytes": newer["bytes"],
+                            "detected_at": older["superseded_at"],
+                            "run": run_dir.name,
+                        }
+                    )
+        except FileNotFoundError:
+            continue
     entries.sort(
         key=lambda e: (
             str(e["neutral_citation"] or ""),
@@ -277,38 +328,85 @@ def _collect_revisions(run_dirs: list[Path]) -> list[dict[str, object]]:
             str(e["detected_at"] or ""),
         )
     )
-    return entries
+    return _RevisionScan(entries=entries, total=total)
 
 
-def _copy_versions(run_dirs: list[Path], dest: Path) -> int:
-    """Copy every run's archived superseded PDFs into the bag payload.
+def _referenced_versions(db_path: Path) -> set[str]:
+    """Basenames of the ``versions/*.pdf`` archives a superseded row in this DB cites.
 
-    Files are content-addressed (``<sha256>.pdf``), so identical names across runs
-    are identical bytes and a dedup by name is safe. They land under
-    ``data/pdfs/versions/`` and are hashed into ``manifest-sha256.txt`` like any
-    payload file, so a published corpus carries -- and attests -- the superseded
-    versions, not just a record that they changed. Returns the count copied.
+    Only superseded ``pdf_version`` rows reference an archived file (the *current*
+    version's bytes are the live PDF, copied by :func:`_copy_pdfs`), so this is the
+    exact set the bag should carry -- anything else under ``pdfs/versions/`` is an
+    orphan. Tolerates a missing/older/corrupt DB the same way the rest of the read
+    path does. Only the basename is kept, so a tampered ``filename`` cannot smuggle
+    a path in; :func:`safe_output_path` re-checks it at copy time regardless.
+    """
+    referenced: set[str] = set()
+    try:
+        for v in iter_pdf_versions(db_path):
+            if v["superseded_at"] is None:
+                continue
+            filename = v["filename"]
+            if filename:
+                referenced.add(PurePosixPath(str(filename)).name)
+    except FileNotFoundError:
+        return referenced
+    return referenced
+
+
+def _copy_versions(run_dirs: list[Path], dest: Path) -> tuple[int, list[str]]:
+    """Copy only *referenced, verified* superseded PDFs into the bag payload.
+
+    A ``versions/<sha256>.pdf`` file is bagged only when a superseded
+    ``pdf_version`` row points at it (so orphaned archive files left on disk are
+    not shipped as unexplained payload) AND its bytes re-hash to the ``<sha256>``
+    in its own name (so a corrupt archive file is never attested as authoritative
+    by BagIt fixity). Files are content-addressed, so identical names across runs
+    are identical bytes; we hash-and-copy each unique name at most once. Copied
+    files land under ``data/pdfs/versions/`` and ride ``manifest-sha256.txt`` like
+    any payload. Returns the count copied and the names that were referenced but
+    could not be verified (missing on disk or digest mismatch) -- a gap the caller
+    surfaces, never hides.
     """
     copied = 0
+    done: set[str] = set()  # names already bagged (dedup across runs)
+    failed: set[str] = set()  # referenced but unverifiable
     for run_dir in run_dirs:
         versions_dir = run_dir / "pdfs" / "versions"
-        if not versions_dir.is_dir():
-            continue
-        for src in sorted(versions_dir.glob("*.pdf")):
+        for name in sorted(_referenced_versions(run_dir / "judgments.sqlite")):
+            if name in done:
+                continue
             try:
-                target = safe_output_path(dest, src.name)
+                src = safe_output_path(versions_dir, name)
+                target = safe_output_path(dest, name)
             except UnsafeFilenameError:
+                failed.add(name)
                 continue
-            if target.exists():
+            # Content-addressed: the trustworthy bytes are exactly those that hash
+            # to the name. Anything that fails to match, or that vanishes / is
+            # unreadable between the check and the read (concurrent prune, perms,
+            # torn copy), surfaces as a gap -- it must never abort the whole bag,
+            # matching iter_pdf_versions' "never abort a corpus build" tolerance.
+            try:
+                if not src.is_file() or sha256_of(src) != src.stem:
+                    failed.add(name)
+                    continue
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+            except OSError:
+                # Drop any partial target so the manifest cannot attest torn bytes.
+                target.unlink(missing_ok=True)
+                failed.add(name)
                 continue
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, target)
             copied += 1
-    return copied
+            done.add(name)
+    # A name that verified in one run is not a gap even if a different run's copy
+    # was missing/corrupt, so subtract what we managed to bag.
+    return copied, sorted(failed - done)
 
 
 def _snapshot(
-    merge: MergeResult, record_count: int, revisions: list[dict[str, object]]
+    merge: MergeResult, record_count: int, revisions: _RevisionScan
 ) -> dict[str, object]:
     return {
         "created": _now_iso(),
@@ -326,13 +424,15 @@ def _snapshot(
             }
             for c in merge.conflicts
         ],
-        # Documents re-fetched and found changed since first archived. The full
-        # count is authoritative; ``entries`` is truncated to keep the snapshot
-        # bounded (superseded PDFs themselves travel in the bag under pdfs/versions/).
+        # Documents re-fetched and found changed since first archived. ``count`` is
+        # the authoritative total; ``entries`` is a bounded, deterministic sample
+        # (capped during aggregation, not just here) so a long history cannot bloat
+        # the snapshot -- the superseded PDFs themselves travel in the bag under
+        # pdfs/versions/.
         "revisions": {
-            "count": len(revisions),
-            "truncated": len(revisions) > _MAX_SNAPSHOT_REVISIONS,
-            "entries": revisions[:_MAX_SNAPSHOT_REVISIONS],
+            "count": revisions.total,
+            "truncated": revisions.total > len(revisions.entries),
+            "entries": revisions.entries,
         },
     }
 
@@ -376,7 +476,12 @@ def _dataset_jsonld(descriptor: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _datasheet(merge: MergeResult, record_count: int, missing: list[str]) -> str:
+def _datasheet(
+    merge: MergeResult,
+    record_count: int,
+    missing: list[str],
+    unverified_versions: list[str],
+) -> str:
     runs = ", ".join(merge.run_names) or "(none)"
     conflicts = len(merge.conflicts)
     return f"""# Datasheet: Courts Service of Ireland judgments
@@ -394,6 +499,8 @@ Ireland (ww2.courts.ie), assembled for legal and computational research.
 - Content conflicts (same document_uuid, differing sha256): {conflicts}. See
   snapshot.json for details.
 - PDFs expected but missing on disk at bag time: {len(missing)}.
+- Superseded versions referenced but unverifiable (missing or digest mismatch),
+  so omitted from the bag: {len(unverified_versions)}.
 
 ## Collection process
 Collected by scraping the public search results and per-judgment view pages,
@@ -506,7 +613,9 @@ def build_corpus(
 
     # PDFs + docs into the payload (latest of each, plus archived superseded ones).
     _copied, missing = _copy_pdfs(merge, runs, data_dir / "pdfs", source_names)
-    _copy_versions(runs, data_dir / "pdfs" / "versions")
+    _copied_versions, unverified_versions = _copy_versions(
+        runs, data_dir / "pdfs" / "versions"
+    )
 
     descriptor = json.loads((data_dir / "datapackage.json").read_text(encoding="utf-8"))
     (data_dir / "dataset.jsonld").write_text(
@@ -517,7 +626,8 @@ def build_corpus(
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (data_dir / "DATASHEET.md").write_text(
-        _datasheet(merge, record_count, missing), encoding="utf-8"
+        _datasheet(merge, record_count, missing, unverified_versions),
+        encoding="utf-8",
     )
 
     # Fixity last, so the manifest covers every payload file written above.
@@ -528,4 +638,5 @@ def build_corpus(
         record_count=record_count,
         conflicts=tuple(merge.conflicts),
         missing_pdfs=tuple(missing),
+        unverified_versions=tuple(unverified_versions),
     )
