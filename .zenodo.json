@@ -1,0 +1,22 @@
+{
+  "title": "courts-scraper: a research scraper for Courts Service of Ireland judgments",
+  "description": "A command-line tool that archives written judgments published by the Courts Service of Ireland (ww2.courts.ie). It builds a queryable SQLite database of judgment metadata and downloads the judgment PDFs into a self-contained, resumable, checksum-verified data folder.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "O'Brien, Eoin",
+      "orcid": "0000-0002-0171-9434"
+    }
+  ],
+  "keywords": [
+    "Ireland",
+    "courts",
+    "judgments",
+    "case law",
+    "legal informatics",
+    "web scraping",
+    "research data"
+  ]
+}
