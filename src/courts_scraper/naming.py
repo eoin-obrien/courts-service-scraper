@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Container
+from pathlib import Path
 
 # A neutral citation looks like: [2026] IESC 36 / [2019] IECA 112 / [2020] IEHC 5
 _CITATION_RE = re.compile(r"^\[(?P<year>\d{4})\]\s+(?P<code>IE[A-Z]+)\s+(?P<num>\d+)")
@@ -21,9 +22,20 @@ _CITATION_RE = re.compile(r"^\[(?P<year>\d{4})\]\s+(?P<code>IE[A-Z]+)\s+(?P<num>
 # Characters we allow in a slug; everything else collapses to the separator.
 _SAFE_CHARS = re.compile(r"[^A-Za-z0-9]+")
 
+# Path separators (both conventions) -- a filename must contain neither.
+_PATH_SEPARATORS = re.compile(r"[/\\]")
+
 # Cap the judge portion so a pathological cell value cannot exceed the OS
 # filename length limit (typically 255 bytes) once combined with the citation.
 _MAX_JUDGE_SLUG = 80
+
+
+class UnsafeFilenameError(ValueError):
+    """Raised when a filename is not a plain, in-directory component.
+
+    Defends the download step against a filename that would escape the output
+    directory (path traversal), e.g. from a tampered database.
+    """
 
 
 class MissingCitationError(ValueError):
@@ -113,3 +125,31 @@ def pdf_filename(
     while f"{stem}_{index}.pdf" in taken:
         index += 1
     return f"{stem}_{index}.pdf"
+
+
+def safe_output_path(directory: Path, filename: str) -> Path:
+    """Join ``filename`` onto ``directory``, rejecting anything that escapes it.
+
+    ``filename`` must be a plain component (no path separators, not ``.``/``..``,
+    not hidden, not absolute) that resolves to a direct child of ``directory``.
+    This is a defence-in-depth check at the filesystem write boundary: filenames
+    produced by :func:`pdf_filename` are already safe, but a tampered database
+    row must never be able to write outside the run's PDF folder.
+
+    Raises:
+        UnsafeFilenameError: If ``filename`` is not a safe in-directory name.
+    """
+    if (
+        not filename
+        or filename in {".", ".."}
+        or filename.startswith(".")
+        or _PATH_SEPARATORS.search(filename)
+    ):
+        raise UnsafeFilenameError(f"unsafe filename: {filename!r}")
+
+    resolved = (directory / filename).resolve()
+    if resolved.parent != directory.resolve():
+        raise UnsafeFilenameError(
+            f"filename escapes the output directory: {filename!r}"
+        )
+    return resolved

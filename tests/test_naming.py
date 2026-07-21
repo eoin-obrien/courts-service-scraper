@@ -1,10 +1,14 @@
+from pathlib import Path
+
 import pytest
 
 from courts_scraper.naming import (
     MissingCitationError,
+    UnsafeFilenameError,
     citation_slug,
     judge_slug,
     pdf_filename,
+    safe_output_path,
 )
 
 
@@ -68,3 +72,88 @@ def test_pdf_filename_collision_suffix():
 def test_pdf_filename_requires_citation():
     with pytest.raises(MissingCitationError):
         pdf_filename(None, "Woulfe J.")
+
+
+# --- security: path traversal / malicious input ---------------------------
+
+# Judge labels are attacker-influenceable (scraped from a page cell), so a
+# malicious value must never survive into a path-bearing filename.
+MALICIOUS_JUDGES = [
+    "../../.bashrc",
+    "../../../etc/passwd",
+    "/etc/passwd",
+    "foo/bar",
+    "a/../../b",
+    r"..\..\windows\system32",
+    r"C:\Windows\System32",
+    "....//....//",
+    ".bashrc",
+    "..",
+    ".",
+    "\x00null",
+    "x" * 500,
+]
+
+
+@pytest.mark.parametrize("judge", MALICIOUS_JUDGES)
+def test_pdf_filename_is_traversal_safe(judge, tmp_path):
+    name = pdf_filename("[2026] IESC 36", judge)
+
+    # The result is a single, plain filename component -- no separators,
+    # no parent refs, not hidden, capped in length, always a .pdf.
+    assert "/" not in name
+    assert "\\" not in name
+    assert ".." not in name
+    assert not name.startswith(".")
+    assert name == Path(name).name
+    assert name.endswith(".pdf")
+    assert len(name) <= 255
+
+    # Joined onto an output directory, it stays a direct child of it.
+    assert (tmp_path / name).resolve().parent == tmp_path.resolve()
+
+
+@pytest.mark.parametrize(
+    "citation",
+    [
+        "[2026] IESC 36/../../../etc/passwd",
+        "[2026] IESC 36/../secret",
+        "[2026] IESC 36 && rm -rf /",
+    ],
+)
+def test_pdf_filename_drops_trailing_citation_garbage(citation):
+    # citation_slug captures only [year] CODE num; anything after is discarded.
+    assert pdf_filename(citation, "Woulfe J.") == "2026_IESC_36_Woulfe-J.pdf"
+
+
+@pytest.mark.parametrize(
+    "citation", ["../../etc/passwd", "/etc/passwd", "[bad]", "..", ""]
+)
+def test_pdf_filename_rejects_non_citation(citation):
+    with pytest.raises(MissingCitationError):
+        pdf_filename(citation, "Woulfe J.")
+
+
+def test_safe_output_path_accepts_plain_filename(tmp_path):
+    path = safe_output_path(tmp_path, "2026_IESC_36_Woulfe-J.pdf")
+    assert path == (tmp_path / "2026_IESC_36_Woulfe-J.pdf").resolve()
+    assert path.parent == tmp_path.resolve()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../evil.pdf",
+        "../../.bashrc",
+        "/etc/passwd",
+        "sub/dir.pdf",
+        r"..\evil.pdf",
+        "..",
+        ".",
+        "",
+        ".hidden",
+    ],
+)
+def test_safe_output_path_rejects_traversal(tmp_path, bad):
+    with pytest.raises(UnsafeFilenameError):
+        safe_output_path(tmp_path, bad)

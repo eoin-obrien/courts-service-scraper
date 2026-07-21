@@ -39,7 +39,11 @@ from courts_scraper.download import (
 )
 from courts_scraper.http import Fetcher, build_client
 from courts_scraper.models import ListRow, RunConfig
-from courts_scraper.naming import MissingCitationError, pdf_filename
+from courts_scraper.naming import (
+    MissingCitationError,
+    pdf_filename,
+    safe_output_path,
+)
 from courts_scraper.parse_list import (
     parse_last_page,
     parse_result_count,
@@ -511,9 +515,11 @@ def _download_row(
     # whose file exists but is still ``pending`` (crash between publish and DB
     # commit) has no stored checksum to trust, so it is simply re-downloaded.
     record_id = row["id"]
-    target = config.pdf_dir / row["filename"]
 
     try:
+        # Verify the stored filename cannot escape the PDF folder before writing
+        # (defence-in-depth against a tampered database row).
+        target = safe_output_path(config.pdf_dir, row["filename"])
         result = download_pdf(
             fetcher,
             row["pdf_url"],

@@ -72,6 +72,57 @@ def test_preview_listing_respects_max_pages(httpx_mock, search_html, tmp_path):
     assert preview.total_pages == 1
 
 
+def test_download_rejects_tampered_filename(tmp_path):
+    """A malicious filename in the DB is refused at the write boundary."""
+    from courts_scraper.db import Repository
+    from courts_scraper.download import CancelToken
+    from courts_scraper.models import JudgmentMeta, ListRow
+    from courts_scraper.run import materialize_run, run_downloads
+
+    config = build_run_config(
+        data_dir=tmp_path,
+        courts=(Court.SUPREME,),
+        delay=0.0,
+        jitter=0.0,
+        max_attempts=1,
+        timeout=10.0,
+        user_agent="test",
+    )
+    materialize_run(config)
+
+    with Repository(config.db_path) as repo:
+        repo.upsert_listing(
+            ListRow(
+                page=0,
+                title="X -v- Y",
+                court="Supreme Court",
+                judge="J",
+                date_delivered=None,
+                date_uploaded=None,
+                view_url="https://ww2.courts.ie/view/x",
+                pdf_url="https://ww2.courts.ie/acc/alfresco/x/a.pdf",
+                collection_uuid="c",
+                document_uuid="d",
+            )
+        )
+        (row,) = list(repo.iter_pending_metadata())
+        # Simulate a tampered row: a filename that escapes the PDF folder.
+        repo.record_metadata(
+            row["id"],
+            JudgmentMeta(neutral_citation="[2026] IESC 36"),
+            "../../evil.pdf",
+        )
+
+        run_downloads(config, _fetcher(), repo, cancel=CancelToken())
+        counts = repo.counts()
+
+    assert counts["download_error"] == 1
+    assert counts["download_done"] == 0
+    # The escape target was never created (the download never ran).
+    assert not (tmp_path / "evil.pdf").exists()
+    assert not (config.pdf_dir / "evil.pdf").exists()
+
+
 def test_build_run_config_does_not_touch_disk(tmp_path):
     config = build_run_config(
         data_dir=tmp_path,
