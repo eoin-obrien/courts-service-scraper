@@ -135,3 +135,23 @@ def test_build_run_config_does_not_touch_disk(tmp_path):
     )
     # The run folder must not exist until it is explicitly materialized.
     assert not config.run_dir.exists()
+
+
+def test_manifest_records_custom_user_agent(tmp_path):
+    import json
+
+    from courts_scraper.run import materialize_run
+
+    config = build_run_config(
+        data_dir=tmp_path,
+        courts=(Court.SUPREME,),
+        delay=5.0,
+        jitter=2.0,
+        max_attempts=4,
+        timeout=60.0,
+        user_agent="my-custom-agent/9.9",
+    )
+    materialize_run(config)
+
+    manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["user_agent"] == "my-custom-agent/9.9"

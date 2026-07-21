@@ -54,6 +54,12 @@ console = Console()
 DEFAULT_USER_AGENT = f"courts-scraper/{__version__} (research tool)"
 
 
+def _validate_user_agent(value: str) -> str:
+    if not value.strip():
+        raise typer.BadParameter("--user-agent must not be empty.")
+    return value
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"courts-scraper {__version__}")
@@ -113,6 +119,14 @@ YesOption = Annotated[
     bool,
     typer.Option(
         "--yes", "-y", help="Skip the confirmation prompt (for unattended runs)."
+    ),
+]
+UserAgentOption = Annotated[
+    str,
+    typer.Option(
+        "--user-agent",
+        callback=_validate_user_agent,
+        help="User-Agent header sent with every request.",
     ),
 ]
 
@@ -184,9 +198,12 @@ def list_cmd(
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
     yes: YesOption = False,
+    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
     """Start a new run and record the paginated search results."""
-    config = _build_config(court, data_dir, delay, jitter, max_attempts, timeout)
+    config = _build_config(
+        court, data_dir, delay, jitter, max_attempts, timeout, user_agent
+    )
     preview, fetcher = _preview_or_exit(config, max_pages)
     _confirm_new_scrape(config, preview, include_downloads=False, yes=yes)
 
@@ -211,9 +228,12 @@ def run_cmd(
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
     yes: YesOption = False,
+    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
     """Run both phases: list the results, then download every PDF."""
-    config = _build_config(court, data_dir, delay, jitter, max_attempts, timeout)
+    config = _build_config(
+        court, data_dir, delay, jitter, max_attempts, timeout, user_agent
+    )
     preview, fetcher = _preview_or_exit(config, max_pages)
     _confirm_new_scrape(config, preview, include_downloads=True, yes=yes)
 
@@ -237,9 +257,10 @@ def download_cmd(
     max_attempts: AttemptsOption = 4,
     timeout: TimeoutOption = 60.0,
     yes: YesOption = False,
+    user_agent: UserAgentOption = DEFAULT_USER_AGENT,
 ) -> None:
     """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
-    config = _load(run_dir, delay, jitter, max_attempts, timeout)
+    config = _load(run_dir, delay, jitter, max_attempts, timeout, user_agent)
     with Repository(config.db_path) as repo:
         counts = repo.counts()
         remaining = counts["total"] - counts["download_done"]
@@ -276,7 +297,7 @@ def download_cmd(
 @app.command("status")
 def status_cmd(run_dir: RunDirOption) -> None:
     """Print progress counts for an existing run folder."""
-    config = _load(run_dir, 5.0, 2.0, 4, 60.0)
+    config = _load(run_dir, 5.0, 2.0, 4, 60.0, DEFAULT_USER_AGENT)
     _print_status(config)
 
 
@@ -287,6 +308,7 @@ def _build_config(
     jitter: float,
     max_attempts: int,
     timeout: float,
+    user_agent: str,
 ) -> RunConfig:
     courts = _courts_or_prompt(court)
     return build_run_config(
@@ -296,12 +318,17 @@ def _build_config(
         jitter=jitter,
         max_attempts=max_attempts,
         timeout=timeout,
-        user_agent=DEFAULT_USER_AGENT,
+        user_agent=user_agent,
     )
 
 
 def _load(
-    run_dir: Path, delay: float, jitter: float, max_attempts: int, timeout: float
+    run_dir: Path,
+    delay: float,
+    jitter: float,
+    max_attempts: int,
+    timeout: float,
+    user_agent: str,
 ) -> RunConfig:
     try:
         return load_run_config(
@@ -310,7 +337,7 @@ def _load(
             jitter=jitter,
             max_attempts=max_attempts,
             timeout=timeout,
-            user_agent=DEFAULT_USER_AGENT,
+            user_agent=user_agent,
         )
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc

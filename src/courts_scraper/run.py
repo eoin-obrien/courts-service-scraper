@@ -189,6 +189,7 @@ def _write_manifest(config: RunConfig) -> None:
         "courts": list(config.courts),
         "delay": config.delay,
         "jitter": config.jitter,
+        "user_agent": config.user_agent,
     }
     config.manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"

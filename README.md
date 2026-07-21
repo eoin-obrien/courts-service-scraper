@@ -62,7 +62,8 @@ uv run courts-scraper status --run-dir data/<timestamp>__supreme
 ```
 
 Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
-`--max-pages` and `--limit` (sampling for testing), `--court` (repeatable).
+`--max-pages` and `--limit` (sampling for testing), `--court` (repeatable),
+`--user-agent` (override the request User-Agent), `--yes` (skip confirmation).
 
 ### Choosing courts and confirming
 
