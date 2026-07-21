@@ -48,6 +48,21 @@ Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`, `ci`,
 3. Ensure the checks above pass locally (the pre-commit hooks do most of this).
 4. Update `README.md` / docstrings if behaviour changes.
 
+## Releasing
+
+Releases are cut with commitizen:
+
+```bash
+uv run cz bump            # bump version everywhere, update CHANGELOG, create the tag
+git push --follow-tags
+```
+
+`cz bump` keeps the version in sync across `pyproject.toml`,
+`src/courts_scraper/__init__.py`, and `CITATION.cff`. It does **not** update
+`CITATION.cff`'s `date-released` (commitizen manages version strings, not dates),
+and that field feeds the citation year -- so set it to the release date by hand
+before pushing the tag.
+
 ## Responsible use
 
 This tool accesses a public government website. Keep the default politeness
