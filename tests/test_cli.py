@@ -440,9 +440,14 @@ def test_corpus_json(make_run_dir, tmp_path):
         "conflicts",
         "missing_pdfs",
         "unverified_versions",
+        "archive",
+        "archive_sha256",
     }
     assert payload["run_count"] == 1
     assert isinstance(payload["missing_pdfs"], int)
+    # No --archive requested, so the archive fields are present but null.
+    assert payload["archive"] is None
+    assert payload["archive_sha256"] is None
 
 
 # --- internal helpers -----------------------------------------------------

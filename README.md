@@ -84,6 +84,8 @@ uv run courts-scraper corpus --out data/corpus
 # ...or choose which runs go in: an interactive checklist, or explicit folders
 uv run courts-scraper corpus --select
 uv run courts-scraper corpus --run-dir data/<run-a> --run-dir data/<run-b>
+# ...and bundle it into one shareable file for coauthors (+ a .sha256 sidecar)
+uv run courts-scraper corpus --archive tar.gz   # or zip / tar / tar.bz2 / tar.xz
 
 # Print the column data dictionary (generated from the schema)
 uv run courts-scraper dictionary

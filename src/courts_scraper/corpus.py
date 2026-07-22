@@ -688,3 +688,90 @@ def build_corpus(
         missing_pdfs=tuple(missing),
         unverified_versions=tuple(unverified_versions),
     )
+
+
+# ---------------------------------------------------------------------------
+# Serialisation: bundle a finished bag into one shareable archive
+# ---------------------------------------------------------------------------
+# User-facing archive formats -> (shutil format name, file extension). Every
+# format is pure stdlib (zipfile/tarfile); the aliases accept the common
+# spellings a user is likely to type.
+_ARCHIVE_FORMATS: dict[str, tuple[str, str]] = {
+    "zip": ("zip", ".zip"),
+    "tar": ("tar", ".tar"),
+    "tar.gz": ("gztar", ".tar.gz"),
+    "tgz": ("gztar", ".tar.gz"),
+    "gztar": ("gztar", ".tar.gz"),
+    "tar.bz2": ("bztar", ".tar.bz2"),
+    "tbz2": ("bztar", ".tar.bz2"),
+    "bztar": ("bztar", ".tar.bz2"),
+    "tar.xz": ("xztar", ".tar.xz"),
+    "txz": ("xztar", ".tar.xz"),
+    "xztar": ("xztar", ".tar.xz"),
+}
+
+#: Canonical archive format names shown to users (one per distinct output).
+ARCHIVE_FORMAT_CHOICES: tuple[str, ...] = ("zip", "tar", "tar.gz", "tar.bz2", "tar.xz")
+
+
+def resolve_archive_format(fmt: str) -> tuple[str, str]:
+    """Map a user-supplied format name to ``(shutil_format, extension)``.
+
+    Accepts the canonical names in :data:`ARCHIVE_FORMAT_CHOICES` plus common
+    aliases (``tgz``, ``tbz2``, ``txz``, a leading dot). Validates that the
+    format is actually available in this Python build (the ``bz2``/``lzma``
+    modules are optional at compile time).
+
+    Raises:
+        ExportError: If ``fmt`` is unknown or unavailable here.
+    """
+    key = fmt.strip().lower().lstrip(".")
+    if key not in _ARCHIVE_FORMATS:
+        choices = ", ".join(ARCHIVE_FORMAT_CHOICES)
+        raise ExportError(f"unknown archive format {fmt!r}; choose one of: {choices}")
+    shutil_fmt, ext = _ARCHIVE_FORMATS[key]
+    available = {name for name, _desc in shutil.get_archive_formats()}
+    if shutil_fmt not in available:
+        raise ExportError(
+            f"archive format {fmt!r} is unavailable in this Python build "
+            f"(its compression module is missing)."
+        )
+    return shutil_fmt, ext
+
+
+def serialize_bag(bag_dir: Path, fmt: str) -> tuple[Path, str]:
+    """Serialise a finished bag directory into one shareable archive.
+
+    Writes a single file alongside ``bag_dir`` whose only top-level entry is the
+    bag directory -- the BagIt serialisation convention, so the result validates
+    directly (e.g. ``bagit.py --validate corpus.tar.gz``). Also writes a
+    ``<archive>.sha256`` sidecar in ``sha256sum`` format so a recipient can verify
+    the download's integrity (the bag's own ``manifest-sha256.txt`` verifies its
+    *contents*; this verifies the *transfer*). The digest is streamed, so a
+    multi-gigabyte corpus never has to fit in memory.
+
+    Args:
+        bag_dir: The finished corpus bag directory (must exist).
+        fmt: An archive format (see :func:`resolve_archive_format`).
+
+    Returns:
+        ``(archive_path, sha256_hex)``.
+
+    Raises:
+        ExportError: If ``bag_dir`` is missing, or ``fmt`` is unknown/unavailable.
+    """
+    if not bag_dir.is_dir():
+        raise ExportError(f"no bag directory to archive at {bag_dir}.")
+    shutil_fmt, _ext = resolve_archive_format(fmt)
+    archive = Path(
+        shutil.make_archive(
+            base_name=str(bag_dir),
+            format=shutil_fmt,
+            root_dir=str(bag_dir.parent),
+            base_dir=bag_dir.name,
+        )
+    )
+    digest = sha256_of(archive)
+    sidecar = archive.with_name(archive.name + ".sha256")
+    sidecar.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    return archive, digest
