@@ -115,6 +115,10 @@ def test_countdown_shows_request_in_flight_and_outage():
     model.apply(RequestStarted("u"))
     assert "flight" in _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
     model.apply(OutagePaused(3))
+    # Paused but not yet probing: no probe countdown is armed, so it must not
+    # claim "probing 0s".
+    paused = _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
+    assert "site down" in paused and "probing" not in paused
     model.apply(OutageProbing(60.0, 118.0))
     assert "probing" in _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
 
@@ -161,29 +165,46 @@ def test_dashboard_renders_bars_and_curated_lines():
     assert "run complete" in text  # final summary
 
 
-def test_dashboard_rows_fit_terminal_width():
-    # AC-9: even a long citation must not wrap the phase or overall row at 80 cols.
-    # Measure ONE clean frame of the two bars (not the live session, whose
-    # export_text glues successive frames together -- the spike's capture caveat).
+def _two_bar_rows_at_80(est_total, phase_items, delay, done, title):
+    # Drive a reporter to a realistic mid-run state and render ONE clean frame of
+    # the two pinned bars (not the live session, whose export_text glues frames --
+    # the spike's capture caveat), returning the non-blank physical rows.
     work = Console(file=io.StringIO(), force_terminal=True, width=80)
-    reporter = LiveDashboardReporter(work, delay=5.0, jitter=1.0, monotonic=lambda: 0.0)
-    reporter.emit(RunStarted("run", ("Supreme Court",), ("downloads",), 5694))
-    reporter.emit(PhaseStarted("downloads", 2712))
-    reporter.emit(
-        ItemStarted(
-            "downloads",
-            "[2024] IESC 12 - DPP v. Murphy & Ors (a very long title indeed)",
-            "u",
-        )
+    reporter = LiveDashboardReporter(
+        work, delay=delay, jitter=0.0, monotonic=lambda: 0.0
     )
-    reporter.emit(WaitStarted(WaitReason.POLITENESS, 3.8, 3.8))
+    courts = ("Supreme Court", "Court of Appeal")
+    reporter.emit(RunStarted("run", courts, ("dl",), est_total))
+    reporter.emit(PhaseStarted("dl", phase_items))
+    for _ in range(done):  # advance both bars so MofN reaches its real width
+        reporter.emit(ItemStarted("dl", "x", "u"))
+        reporter.emit(RequestStarted("u"))
+        reporter.emit(ItemFinished("dl", ItemStatus.OK))
+    reporter.emit(ItemStarted("dl", title, "u"))
+    reporter.emit(WaitStarted(WaitReason.POLITENESS, delay, delay))
     reporter._sync_bars()
     frame = Console(file=io.StringIO(), record=True, force_terminal=True, width=80)
     frame.print(reporter._progress.get_renderable())
-    rows = [line for line in frame.export_text().splitlines() if line.strip()]
-    assert len(rows) == 2  # exactly the two bars, each on its own line (no wrap)
-    for line in rows:
-        assert len(line.rstrip()) <= 80, repr(line)
+    return [line for line in frame.export_text().splitlines() if line.strip()]
+
+
+def test_dashboard_rows_fit_terminal_width():
+    # AC-9: neither bar may wrap at 80 cols -- the reskin's whole point. The bar
+    # is the flex column (bar_width=None) and the trailer is no_wrap, so a long
+    # citation, a 5-6 digit MofN, or a multi-hour ETA must all clip, not wrap.
+    # Parametrized over realistic wide loads (a single-court run *and* a big
+    # multi-court run) so the pass isn't calibrated to one lucky width.
+    long_title = "[2024] IESC 12 - DPP v. Murphy & Ors (a very long title indeed)"
+    scenarios = [
+        (5_694, 2_712, 5.0, 3, long_title),  # single court
+        (50_000, 41_000, 5.0, 3, long_title),  # multi-court: 5-digit MofN, big ETA
+        (200_000, 150_000, 15.0, 7, long_title),  # extreme: 6-digit MofN, big ETA
+    ]
+    for est_total, phase_items, delay, done, title in scenarios:
+        rows = _two_bar_rows_at_80(est_total, phase_items, delay, done, title)
+        assert len(rows) == 2, (est_total, rows)  # two bars, each one line (no wrap)
+        for line in rows:
+            assert len(line.rstrip()) <= 80, (est_total, repr(line))
 
 
 def test_dashboard_handles_unknown_phase_total():

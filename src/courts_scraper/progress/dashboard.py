@@ -94,8 +94,12 @@ def _countdown_text(snap: Snapshot, now: float, clamp: float, g: Glyphs) -> str:
     Kept pure so its timing behaviour is unit-testable. During an outage it shows
     the probe state instead of a request countdown.
     """
-    if snap.outage_state in ("paused", "probing"):
+    if snap.outage_state == "probing":
         return f"{g.pause} probing {int(snap.outage_probe_in)}s"
+    if snap.outage_state == "paused":
+        # Paused but the probe countdown hasn't been armed yet (OutageProbing
+        # sets outage_probe_in); showing "probing 0s" here would be a lie.
+        return f"{g.pause} site down"
     if snap.requesting:
         return f"{g.dot} request in flight"
     if snap.wait_until_monotonic is not None:
@@ -186,7 +190,9 @@ class _TrailerColumn(ProgressColumn):
         monotonic: Callable[[], float],
     ) -> None:
         """Wire the column to the model and the clock."""
-        super().__init__()
+        # no_wrap so a long ETA/countdown clips instead of wrapping the pinned
+        # bar onto a second physical line at narrow widths.
+        super().__init__(table_column=Column(no_wrap=True))
         self._model = model
         self._clamp = clamp
         self._glyphs = glyphs
@@ -233,13 +239,17 @@ class LiveDashboardReporter:
         self._progress = Progress(
             SpinnerColumn(spinner_name=spinner),
             # Fixed-width, non-wrapping description so a long citation on the phase
-            # row cannot widen the shared column and wrap the (short) overall row;
-            # the flexible bar absorbs the slack. rich ellipsizes any overflow.
+            # row cannot widen the shared column and wrap the (short) overall row.
+            # rich ellipsizes any overflow.
             TextColumn(
                 "[bold]{task.description}",
                 table_column=Column(width=_DESC_MAX, no_wrap=True, overflow="ellipsis"),
             ),
-            BarColumn(),
+            # bar_width=None makes the bar the *flexible* column: it shrinks to
+            # absorb whatever the fixed columns leave, so a 5-digit MofN or a
+            # long ETA never pushes the row past the terminal width (the trailer
+            # is no_wrap, so it clips rather than wrapping to a second line).
+            BarColumn(bar_width=None),
             MofNCompleteColumn(),
             _TrailerColumn(
                 self._model,
