@@ -986,9 +986,59 @@ def dictionary_cmd(
         print(markdown, end="")
 
 
+def _resolve_corpus_runs(
+    readable: list[RunInfo],
+    explicit: list[Path],
+    *,
+    select: bool,
+    json_out: bool,
+) -> list[Path]:
+    """Decide which run folders go into the corpus.
+
+    Precedence: explicit ``--run-dir`` folders, else an interactive ``--select``
+    checklist, else every readable run.
+    """
+    if explicit and select:
+        raise typer.BadParameter("--run-dir and --select cannot be combined.")
+    if explicit:
+        by_path = {run.path.resolve(): run for run in readable}
+        chosen: list[Path] = []
+        for path in explicit:
+            run = by_path.get(path.resolve())
+            if run is None:
+                raise typer.BadParameter(
+                    f"{path} is not a readable run under the data directory."
+                )
+            chosen.append(run.path)
+        return chosen
+    if select:
+        if json_out:
+            raise typer.BadParameter(
+                "--select needs a terminal and cannot be combined with --json."
+            )
+        return [run.path for run in prompts.select_runs(readable)]
+    return [run.path for run in readable]
+
+
 @app.command("corpus", rich_help_panel="Publish")
 def corpus_cmd(
     ctx: typer.Context,
+    run_dir: Annotated[
+        list[Path],
+        typer.Option(
+            "--run-dir",
+            help="Include only this run (repeatable). If omitted, every readable "
+            "run is included, or use --select to choose interactively.",
+        ),
+    ] = [],  # noqa: B006 -- Typer requires a literal default
+    select: Annotated[
+        bool,
+        typer.Option(
+            "--select",
+            help="Choose which runs to include from an interactive checklist "
+            "(all pre-checked). Needs a terminal; not combinable with --json.",
+        ),
+    ] = False,
     out: Annotated[
         Path | None,
         typer.Option("--out", help="Output bag folder (default: <data-dir>/corpus)."),
@@ -999,11 +1049,16 @@ def corpus_cmd(
     ] = "csv,json",
     json_out: JsonOption = False,
 ) -> None:
-    """Merge all runs into one citable BagIt corpus (dedup + fixity + datasheet)."""
+    """Merge runs into one citable BagIt corpus (dedup + fixity + datasheet).
+
+    Includes every readable run by default; narrow it with repeatable ``--run-dir``
+    folders, or ``--select`` to pick from an interactive checklist.
+    """
     data_dir = _state(ctx).data_dir
-    run_dirs = [run.path for run in list_runs(data_dir) if run.readable]
-    if not run_dirs:
+    readable = [run for run in list_runs(data_dir) if run.readable]
+    if not readable:
         raise typer.BadParameter(f"no readable runs under {data_dir}.")
+    run_dirs = _resolve_corpus_runs(readable, run_dir, select=select, json_out=json_out)
     out_dir = out if out is not None else data_dir / "corpus"
     formats = [token.strip() for token in fmt.split(",") if token.strip()]
     if not formats:

@@ -9,6 +9,14 @@ prepends each release's notes below and follows
 
 ### Feat
 
+- let `corpus` choose which runs to include: `--select` opens an interactive
+  checklist (all pre-checked), or pass repeatable `--run-dir` folders; the default
+  is still every readable run
+- expand the derived-dataset controlled vocabularies from observed values: add
+  `Unapproved` to the `Status` vocabulary, and match `Result` against a
+  case/trailing-punctuation-normalised form seeded with the recurring canonical
+  labels (so genuine free-text results still flag as drift, but standard outcomes
+  no longer flood the flags -- ~98% -> ~12% flagged on the crawled corpus)
 - add `--retry-skipped` to `fetch` (resume) and `update`, which re-queues rows an
   earlier pass skipped (e.g. a judgment not yet assigned a Neutral Citation) so a
   later run resolves them once the Courts Service backfills the metadata

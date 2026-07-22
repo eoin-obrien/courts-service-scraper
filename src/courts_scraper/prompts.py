@@ -88,6 +88,42 @@ def select_run(runs: list[RunInfo]) -> RunInfo:
     return selected
 
 
+def select_runs(runs: list[RunInfo]) -> list[RunInfo]:
+    """Prompt for which runs to include with a checkbox multiselect.
+
+    All runs are pre-checked (the default corpus is "everything"); the user
+    unchecks any to exclude.
+
+    Args:
+        runs: Selectable (readable) runs, newest first.
+
+    Raises:
+        typer.BadParameter: If there are no runs, or there is no interactive
+            terminal (the caller must pass explicit ``--run-dir`` folders, or
+            drop ``--select`` to include every readable run).
+        typer.Abort: If the user cancels or unchecks everything.
+    """
+    if not runs:
+        raise typer.BadParameter("no readable runs to select from.")
+    if not is_interactive():
+        raise typer.BadParameter(
+            "--select needs an interactive terminal; pass explicit --run-dir "
+            "folders (repeatable) instead, or drop --select to include every "
+            "readable run."
+        )
+
+    choices = [
+        questionary.Choice(title=run.summary, value=run, checked=True) for run in runs
+    ]
+    selected: list[RunInfo] | None = questionary.checkbox(
+        "Select runs to include in the corpus:", choices=choices
+    ).ask()
+
+    if not selected:  # None (Ctrl-C) or [] (confirmed with nothing checked)
+        raise typer.Abort()
+    return selected
+
+
 _START_NEW = "__start_new__"
 
 
