@@ -32,7 +32,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from courts_scraper.http import Fetcher, is_retryable
+from courts_scraper.http import Fetcher, is_retryable, retry_before_sleep
 
 _CHUNK = 64 * 1024
 _PART_SUFFIX = ".part"
@@ -194,6 +194,9 @@ def download_pdf(
         stop=stop_after_attempt(max_attempts),
         wait=wait_exponential_jitter(initial=1.0, max=30.0),
         reraise=True,
+        before_sleep=retry_before_sleep(
+            lambda: fetcher.reporter, lambda _state: url, max_attempts
+        ),
     )
     def _attempt() -> DownloadResult:
         return _download_once(fetcher, url, target, cancel)
@@ -237,6 +240,9 @@ def download_to_scratch(
         stop=stop_after_attempt(max_attempts),
         wait=wait_exponential_jitter(initial=1.0, max=30.0),
         reraise=True,
+        before_sleep=retry_before_sleep(
+            lambda: fetcher.reporter, lambda _state: url, max_attempts
+        ),
     )
     def _attempt() -> DownloadResult:
         return _stream_to_part(fetcher, url, scratch, cancel)

@@ -12,6 +12,13 @@ import random
 import time
 from collections.abc import Callable
 
+from courts_scraper.progress import (
+    ProgressReporter,
+    QuietReporter,
+    WaitReason,
+    WaitStarted,
+)
+
 
 class RateLimiter:
     """Blocks until at least ``delay`` (+ jitter) seconds since the last call."""
@@ -40,13 +47,31 @@ class RateLimiter:
         self._monotonic = monotonic
         self._rng = rng or random.Random()
         self._last: float | None = None
+        self._reporter: ProgressReporter = QuietReporter()
 
-    def wait(self) -> None:
-        """Sleep as needed so successive calls are adequately spaced."""
+    def set_reporter(self, reporter: ProgressReporter) -> None:
+        """Attach the progress reporter that receives politeness waits."""
+        self._reporter = reporter
+
+    def wait(self, *, announce: bool = True) -> None:
+        """Sleep as needed so successive calls are adequately spaced.
+
+        Emits a :class:`WaitStarted` before a real (non-zero) sleep so a dashboard
+        can animate a countdown while this call blocks -- but only when there is
+        actually time to wait and this is not the first request, and only when
+        ``announce`` is set (an outage liveness probe passes ``announce=False`` so
+        its wait is not mislabelled as politeness).
+        """
         target = self._delay + self._rng.uniform(0.0, self._jitter)
         now = self._monotonic()
         if self._last is not None:
             remaining = target - (now - self._last)
             if remaining > 0:
+                if announce:
+                    # The wait ends ``remaining`` seconds from ``now`` (which we
+                    # already read); do not consume another clock reading.
+                    self._reporter.emit(
+                        WaitStarted(WaitReason.POLITENESS, remaining, now + remaining)
+                    )
                 self._sleep(remaining)
         self._last = self._monotonic()

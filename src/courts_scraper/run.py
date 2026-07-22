@@ -24,15 +24,6 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-)
-
 from courts_scraper import __version__
 from courts_scraper.db import Repository
 from courts_scraper.download import (
@@ -58,11 +49,32 @@ from courts_scraper.parse_list import (
     parse_search_page,
 )
 from courts_scraper.parse_view import parse_view_page
+from courts_scraper.progress import (
+    Cancelled,
+    ItemFinished,
+    ItemStarted,
+    ItemStatus,
+    PhaseFinished,
+    PhaseStarted,
+    ProgressReporter,
+    QuietReporter,
+)
+
+# Re-exported for the CLI and tests, which have long imported it from here; the
+# canonical definition now lives in the progress package (importable by the sinks
+# without a cycle).
+from courts_scraper.progress.format import format_duration as format_duration
 from courts_scraper.query import Court, build_query
 from courts_scraper.ratelimit import RateLimiter
 from courts_scraper.recovery import OutageBreaker, Outcome
 
 DEFAULT_BASE_URL = "https://ww2.courts.ie"
+
+#: Stable phase identifiers shared by the engine and the render sinks.
+PHASE_LISTING = "listing"
+PHASE_METADATA = "metadata"
+PHASE_DOWNLOADS = "downloads"
+PHASE_REVALIDATE = "revalidate"
 
 
 class ListingError(RuntimeError):
@@ -307,18 +319,6 @@ def build_fetcher(
     return Fetcher(client, limiter, max_attempts)
 
 
-def format_duration(seconds: float) -> str:
-    """Render a rough duration as ``"45s"``, ``"12m"``, or ``"1h 5m"``."""
-    total = max(0, round(seconds))
-    if total < 60:
-        return f"{total}s"
-    minutes, secs = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes}m" if secs < 30 else f"{minutes}m {secs}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes}m"
-
-
 def estimate_seconds(requests: int, *, delay: float, jitter: float) -> float:
     """Estimate wall-clock seconds for ``requests`` polite requests."""
     return requests * (delay + jitter / 2)
@@ -384,16 +384,6 @@ def _append_error(config: RunConfig, reason: str, detail: str) -> None:
     line = f"[{datetime.now(UTC).isoformat()}] {reason} | {detail}\n"
     with config.error_log_path.open("a", encoding="utf-8") as handle:
         handle.write(line)
-
-
-def _progress(console: Console) -> Progress:
-    return Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +476,7 @@ def run_listing(
     repo: Repository,
     *,
     preview: ListingPreview,
-    console: Console | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> int:
     """Populate the database from the paginated search results.
 
@@ -496,31 +486,32 @@ def run_listing(
         repo: Open repository.
         preview: The already-fetched first page (from :func:`preview_listing`);
             its first page is reused rather than re-fetched.
-        console: Rich console for progress output.
+        reporter: Progress sink (defaults to the null sink).
 
     Returns:
         The number of rows recorded across all fetched pages.
     """
-    console = console or Console()
+    reporter = reporter or QuietReporter()
     from courts_scraper.query import search_url
 
-    console.print(
-        f"Search reports [bold]{preview.total_results or '?'}[/] results "
-        f"across pages 0..{preview.last_page}."
-    )
+    total_pages = preview.total_pages
+    reporter.emit(PhaseStarted(PHASE_LISTING, total_pages))
 
+    # Page 0 was already fetched for the preview; record it and mark it done
+    # without a second request.
     recorded = _record_rows(preview.first_rows, repo)
-    with _progress(console) as progress:
-        task = progress.add_task("Listing pages", total=preview.total_pages)
-        progress.advance(task)
-        for page in range(1, preview.last_page + 1):
-            page_html = fetcher.get_text(
-                search_url(config.base_url, config.query, page=page)
-            )
-            rows = parse_search_page(page_html, config.base_url, page)
-            recorded += _record_rows(rows, repo)
-            progress.advance(task)
+    reporter.emit(ItemStarted(PHASE_LISTING, f"page 1/{total_pages}", ""))
+    reporter.emit(ItemFinished(PHASE_LISTING, ItemStatus.OK))
 
+    for page in range(1, preview.last_page + 1):
+        url = search_url(config.base_url, config.query, page=page)
+        reporter.emit(ItemStarted(PHASE_LISTING, f"page {page + 1}/{total_pages}", url))
+        page_html = fetcher.get_text(url)
+        rows = parse_search_page(page_html, config.base_url, page)
+        recorded += _record_rows(rows, repo)
+        reporter.emit(ItemFinished(PHASE_LISTING, ItemStatus.OK))
+
+    reporter.emit(PhaseFinished(PHASE_LISTING, dict(repo.counts())))
     return recorded
 
 
@@ -540,7 +531,7 @@ def run_metadata(
     *,
     cancel: CancelToken,
     limit: int | None = None,
-    console: Console | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> None:
     """Scrape each pending row's view page for authoritative metadata.
 
@@ -552,47 +543,47 @@ def run_metadata(
     ``--limit`` sampling runs stay fast by matching metadata work to the capped
     number of downloads; leave it ``None`` for a full crawl.
     """
-    console = console or Console()
+    reporter = reporter or QuietReporter()
     pending = list(repo.iter_pending_metadata())
     if limit is not None:
         pending = pending[:limit]
     if not pending:
         return
 
-    breaker = OutageBreaker(fetcher, config.base_url, console)
-    with _progress(console) as progress:
-        task = progress.add_task("Fetching metadata", total=len(pending))
-        for row in pending:
-            if cancel.cancelled:
-                console.print("[yellow]Cancelled during metadata phase.[/]")
-                break
-            try:
-                outcome, exc = breaker.run(
-                    partial(_resolve_metadata, config, fetcher, repo, row, console)
-                )
-            except Exception as err:  # parse/db error -- record and continue
-                repo.record_meta_error(row["id"], f"{type(err).__name__}: {err}")
-                _append_error(
-                    config, "metadata_error", f"{row['title']} | {row['view_url']}"
-                )
-                console.print(f"[red]Metadata error:[/] {row['title']} (skipped)")
-                progress.advance(task)
-                continue
+    reporter.emit(PhaseStarted(PHASE_METADATA, len(pending)))
+    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    for row in pending:
+        if cancel.cancelled:
+            reporter.emit(Cancelled(PHASE_METADATA))
+            break
+        reporter.emit(ItemStarted(PHASE_METADATA, row["title"], row["view_url"]))
+        try:
+            # _resolve_metadata emits the terminal ItemFinished on its own success
+            # paths (OK or a no-citation skip); this level only reports failures.
+            outcome, exc = breaker.run(
+                partial(_resolve_metadata, config, fetcher, repo, row, reporter)
+            )
+        except Exception as err:  # parse/db error -- record and continue
+            repo.record_meta_error(row["id"], f"{type(err).__name__}: {err}")
+            _append_error(
+                config, "metadata_error", f"{row['title']} | {row['view_url']}"
+            )
+            reporter.emit(ItemFinished(PHASE_METADATA, ItemStatus.ERROR, row["title"]))
+            continue
 
-            if outcome is Outcome.GAVE_UP:
-                console.print("[red]Stopping the metadata phase (site down).[/]")
-                break
-            if outcome is Outcome.DEFER:
-                _append_error(
-                    config,
-                    "metadata_fetch_failed",
-                    f"{row['title']} | {row['view_url']} | {exc}",
-                )
-                console.print(
-                    f"[red]Metadata fetch failed[/] (will retry on resume): "
-                    f"{row['title']}"
-                )
-            progress.advance(task)
+        if outcome is Outcome.GAVE_UP:
+            break  # the breaker already reported the outage give-up
+        if outcome is Outcome.DEFER:
+            _append_error(
+                config,
+                "metadata_fetch_failed",
+                f"{row['title']} | {row['view_url']} | {exc}",
+            )
+            reporter.emit(
+                ItemFinished(PHASE_METADATA, ItemStatus.DEFERRED, row["title"])
+            )
+
+    reporter.emit(PhaseFinished(PHASE_METADATA, dict(repo.counts())))
 
 
 def _resolve_metadata(
@@ -600,7 +591,7 @@ def _resolve_metadata(
     fetcher: Fetcher,
     repo: Repository,
     row: sqlite3.Row,
-    console: Console,
+    reporter: ProgressReporter,
 ) -> None:
     record_id = row["id"]
     # Each document has its own view page; we fetch every one so the archived
@@ -618,10 +609,13 @@ def _resolve_metadata(
         _append_error(
             config, "no_neutral_citation", f"{row['title']} | {row['view_url']}"
         )
-        console.print(f"[yellow]No citation:[/] {row['title']} (skipped)")
+        reporter.emit(
+            ItemFinished(PHASE_METADATA, ItemStatus.SKIPPED_NO_CITATION, row["title"])
+        )
         return
 
     repo.record_metadata(record_id, meta, filename)
+    reporter.emit(ItemFinished(PHASE_METADATA, ItemStatus.OK))
 
 
 # ---------------------------------------------------------------------------
@@ -634,60 +628,61 @@ def run_downloads(
     *,
     cancel: CancelToken,
     limit: int | None = None,
-    console: Console | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> None:
     """Download every ready PDF into the run's ``pdfs/`` folder.
 
     Startup first sweeps orphaned ``.part`` files. Each download is atomic and
     checksum-verified; an already-verified file is skipped on resume.
     """
-    console = console or Console()
-    swept = sweep_partials(config.pdf_dir)
-    if swept:
-        console.print(f"Removed {swept} orphaned partial file(s).")
+    reporter = reporter or QuietReporter()
+    sweep_partials(config.pdf_dir)
 
     pending = list(repo.iter_pending_downloads())
     if limit is not None:
         pending = pending[:limit]
+    reporter.emit(PhaseStarted(PHASE_DOWNLOADS, len(pending)))
     if not pending:
-        console.print("Nothing to download.")
+        reporter.emit(PhaseFinished(PHASE_DOWNLOADS, dict(repo.counts())))
         return
 
-    breaker = OutageBreaker(fetcher, config.base_url, console)
-    with _progress(console) as progress:
-        task = progress.add_task("Downloading PDFs", total=len(pending))
-        for row in pending:
-            if cancel.cancelled:
-                console.print("[yellow]Cancelled -- partial file discarded.[/]")
-                break
-            try:
-                outcome, exc = breaker.run(
-                    partial(_download_row, config, fetcher, repo, row, cancel)
-                )
-            except DownloadCancelled:
-                console.print("[yellow]Cancelled -- partial file discarded.[/]")
-                break
-            except Exception as err:  # e.g. unsafe filename -- record and continue
-                repo.record_download_error(row["id"], f"{type(err).__name__}: {err}")
-                _append_error(
-                    config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
-                )
-                console.print(f"[red]Failed:[/] {row['filename']}")
-                progress.advance(task)
-                continue
+    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    for row in pending:
+        if cancel.cancelled:
+            reporter.emit(Cancelled(PHASE_DOWNLOADS))
+            break
+        reporter.emit(ItemStarted(PHASE_DOWNLOADS, row["filename"], row["pdf_url"]))
+        try:
+            outcome, exc = breaker.run(
+                partial(_download_row, config, fetcher, repo, row, cancel)
+            )
+        except DownloadCancelled:
+            reporter.emit(Cancelled(PHASE_DOWNLOADS))
+            break
+        except Exception as err:  # e.g. unsafe filename -- record and continue
+            repo.record_download_error(row["id"], f"{type(err).__name__}: {err}")
+            _append_error(
+                config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
+            )
+            reporter.emit(
+                ItemFinished(PHASE_DOWNLOADS, ItemStatus.ERROR, row["filename"])
+            )
+            continue
 
-            if outcome is Outcome.GAVE_UP:
-                console.print("[red]Stopping the download phase (site down).[/]")
-                break
-            if outcome is Outcome.DEFER:
-                repo.record_download_error(row["id"], f"{exc}")
-                _append_error(
-                    config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
-                )
-                console.print(
-                    f"[red]Download failed[/] (will retry on resume): {row['filename']}"
-                )
-            progress.advance(task)
+        if outcome is Outcome.GAVE_UP:
+            break  # the breaker already reported the outage give-up
+        if outcome is Outcome.DEFER:
+            repo.record_download_error(row["id"], f"{exc}")
+            _append_error(
+                config, "download_failed", f"{row['filename']} | {row['pdf_url']}"
+            )
+            reporter.emit(
+                ItemFinished(PHASE_DOWNLOADS, ItemStatus.DEFERRED, row["filename"])
+            )
+        else:
+            reporter.emit(ItemFinished(PHASE_DOWNLOADS, ItemStatus.OK))
+
+    reporter.emit(PhaseFinished(PHASE_DOWNLOADS, dict(repo.counts())))
 
 
 def _download_row(
@@ -738,7 +733,7 @@ def revalidate_downloads(
     cancel: CancelToken,
     limit: int | None = None,
     fetched_before: str | None = None,
-    console: Console | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> int:
     """Re-fetch every downloaded PDF and record any content change (Tier 2).
 
@@ -763,61 +758,60 @@ def revalidate_downloads(
     combined ``update --revalidate`` does not immediately re-download the judgments
     it just fetched. Returns the number of changed documents detected this run.
     """
-    console = console or Console()
-    swept = sweep_partials(config.pdf_dir)
-    if swept:
-        console.print(f"Removed {swept} orphaned partial file(s).")
+    reporter = reporter or QuietReporter()
+    sweep_partials(config.pdf_dir)
 
     repo.backfill_pdf_versions()
     targets = list(repo.iter_revalidation_targets(fetched_before=fetched_before))
     if limit is not None:
         targets = targets[:limit]
+    reporter.emit(PhaseStarted(PHASE_REVALIDATE, len(targets)))
     if not targets:
-        console.print("Nothing to revalidate.")
+        reporter.emit(PhaseFinished(PHASE_REVALIDATE, dict(repo.counts())))
         return 0
 
     before = repo.count_revisions()
-    breaker = OutageBreaker(fetcher, config.base_url, console)
-    with _progress(console) as progress:
-        task = progress.add_task("Revalidating PDFs", total=len(targets))
-        for row in targets:
-            if cancel.cancelled:
-                console.print("[yellow]Cancelled during revalidation.[/]")
-                break
-            try:
-                outcome, exc = breaker.run(
-                    partial(_revalidate_row, config, fetcher, repo, row, cancel)
-                )
-            except DownloadCancelled:
-                console.print("[yellow]Cancelled -- scratch discarded.[/]")
-                break
-            except Exception as err:  # unsafe filename etc. -- log, keep row 'done'
-                _append_error(
-                    config,
-                    "revalidate_error",
-                    f"{row['filename']} | {row['pdf_url']} | "
-                    f"{type(err).__name__}: {err}",
-                )
-                console.print(f"[red]Revalidate error:[/] {row['filename']} (skipped)")
-                progress.advance(task)
-                continue
+    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    for row in targets:
+        if cancel.cancelled:
+            reporter.emit(Cancelled(PHASE_REVALIDATE))
+            break
+        reporter.emit(ItemStarted(PHASE_REVALIDATE, row["filename"], row["pdf_url"]))
+        try:
+            outcome, exc = breaker.run(
+                partial(_revalidate_row, config, fetcher, repo, row, cancel)
+            )
+        except DownloadCancelled:
+            reporter.emit(Cancelled(PHASE_REVALIDATE))
+            break
+        except Exception as err:  # unsafe filename etc. -- log, keep row 'done'
+            _append_error(
+                config,
+                "revalidate_error",
+                f"{row['filename']} | {row['pdf_url']} | {type(err).__name__}: {err}",
+            )
+            reporter.emit(
+                ItemFinished(PHASE_REVALIDATE, ItemStatus.ERROR, row["filename"])
+            )
+            continue
 
-            if outcome is Outcome.GAVE_UP:
-                console.print("[red]Stopping revalidation (site down).[/]")
-                break
-            if outcome is Outcome.DEFER:
-                # Leave the row unchecked (last_revalidated_at untouched) so it is
-                # retried first next run; the good 'done' file is not disturbed.
-                _append_error(
-                    config,
-                    "revalidate_fetch_failed",
-                    f"{row['filename']} | {row['pdf_url']} | {exc}",
-                )
-                console.print(
-                    f"[red]Revalidate fetch failed[/] (will retry on resume): "
-                    f"{row['filename']}"
-                )
-            progress.advance(task)
+        if outcome is Outcome.GAVE_UP:
+            break  # the breaker already reported the outage give-up
+        if outcome is Outcome.DEFER:
+            # Leave the row unchecked (last_revalidated_at untouched) so it is
+            # retried first next run; the good 'done' file is not disturbed.
+            _append_error(
+                config,
+                "revalidate_fetch_failed",
+                f"{row['filename']} | {row['pdf_url']} | {exc}",
+            )
+            reporter.emit(
+                ItemFinished(PHASE_REVALIDATE, ItemStatus.DEFERRED, row["filename"])
+            )
+        else:
+            reporter.emit(ItemFinished(PHASE_REVALIDATE, ItemStatus.OK))
+
+    reporter.emit(PhaseFinished(PHASE_REVALIDATE, dict(repo.counts())))
 
     return repo.count_revisions() - before
 
