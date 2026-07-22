@@ -132,8 +132,11 @@ def test_phase_done_resets_per_phase():
     model.apply(ItemFinished("metadata", ItemStatus.OK))
     from courts_scraper.progress import PhaseStarted
 
-    model.apply(PhaseStarted("downloads", 2, 2, 3))
-    assert model.snapshot().phase_done == 0
+    model.apply(PhaseStarted("downloads", 3))
+    snap = model.snapshot()
+    assert snap.phase_done == 0
+    assert snap.phase_index == 2  # derived from RunStarted.phases
+    assert snap.phase_total == 2
     model.apply(ItemFinished("downloads", ItemStatus.OK))
     assert model.snapshot().phase_done == 1
 

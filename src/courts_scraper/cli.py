@@ -42,8 +42,14 @@ from courts_scraper.db import Repository
 from courts_scraper.export import ExportError, data_dictionary_markdown, export_run
 from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
+from courts_scraper.progress import ProgressReporter, RunFinished, RunStarted
+from courts_scraper.progress.select import select_reporter
 from courts_scraper.query import Court
 from courts_scraper.run import (
+    PHASE_DOWNLOADS,
+    PHASE_LISTING,
+    PHASE_METADATA,
+    PHASE_REVALIDATE,
     ListingError,
     ListingPreview,
     RunLocked,
@@ -113,6 +119,45 @@ def _engine_console(state: AppState, *, json_out: bool) -> Console:
     if json_out:
         return Console(quiet=True) if state.quiet else err_console
     return _run_console(state)
+
+
+def _build_reporter(
+    state: AppState, config: RunConfig, *, json_out: bool = False
+) -> ProgressReporter:
+    """Pick the progress reporter for this run's output surface."""
+    return select_reporter(
+        _engine_console(state, json_out=json_out),
+        quiet=state.quiet,
+        delay=config.delay,
+        jitter=config.jitter,
+        prefer_plain=json_out,
+    )
+
+
+def _est_requests_fresh(preview: ListingPreview, *, include_downloads: bool) -> int:
+    """Estimate total requests for a fresh crawl (listing + metadata + downloads)."""
+    known = (
+        preview.total_results
+        if preview.total_results is not None
+        else len(preview.first_rows)
+    )
+    return preview.total_pages + (2 * known if include_downloads else 0)
+
+
+def _est_requests_resume(counts: dict[str, int]) -> int:
+    """Estimate remaining requests for a resume/update (metadata + downloads)."""
+    return (
+        counts["meta_pending"] + counts["download_pending"] + counts["download_error"]
+    )
+
+
+def _run_finished(repo: Repository) -> RunFinished:
+    """Build the terminal :class:`RunFinished` event from the run's counts."""
+    counts = dict(repo.counts())
+    complete = (
+        counts["meta_pending"] == 0 and counts["download_done"] >= counts["meta_ok"]
+    )
+    return RunFinished(counts, 0.0, incomplete=not complete)
 
 
 def _validate_user_agent(value: str) -> str:
@@ -466,25 +511,41 @@ def _fetch_new(
     _confirm_new_scrape(config, preview, include_downloads=not list_only, yes=yes)
 
     materialize_run(config)
-    out = _run_console(state)
     cancel = install_cancel_handler()
+    reporter = _build_reporter(state, config)
+    phases = (
+        (PHASE_LISTING,)
+        if list_only
+        else (PHASE_LISTING, PHASE_METADATA, PHASE_DOWNLOADS)
+    )
+    est = _est_requests_fresh(preview, include_downloads=not list_only)
     recorded = 0
     # Lock even the fresh run: folder names are only second-precise, so two
     # `fetch -c` for the same courts started in the same second would otherwise
-    # share a directory and corrupt one SQLite DB / .part set.
+    # share a directory and corrupt one SQLite DB / .part set. The reporter is the
+    # outermost context so its live display restores the terminal on any exit.
     try:
-        with run_lock(config.run_dir), Repository(config.db_path) as repo:
-            recorded = run_listing(config, fetcher, repo, preview=preview, console=out)
+        with (
+            reporter,
+            run_lock(config.run_dir),
+            Repository(config.db_path) as repo,
+        ):
+            fetcher.set_reporter(reporter)
+            reporter.emit(RunStarted(config.run_dir.name, config.courts, phases, est))
+            recorded = run_listing(
+                config, fetcher, repo, preview=preview, reporter=reporter
+            )
             # Record listing completeness only once the listing pass has finished,
             # so an interrupted crawl never leaves a manifest that claims "complete".
             finalize_listing(config, preview)
             if not list_only:
                 run_metadata(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                    config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
                 )
                 run_downloads(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                    config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
                 )
+            reporter.emit(_run_finished(repo))
     except RunLocked as exc:
         err_console.print(f"[yellow]{exc}[/]")
         raise typer.Exit(code=1) from exc
@@ -538,15 +599,26 @@ def _fetch_resume(
 
         cancel = install_cancel_handler()
         fetcher = open_fetcher(config)
-        out = _run_console(state)
+        reporter = _build_reporter(state, config)
+        phases = (PHASE_METADATA, PHASE_DOWNLOADS)
         try:
-            with run_lock(config.run_dir):
+            with reporter, run_lock(config.run_dir):
+                fetcher.set_reporter(reporter)
+                reporter.emit(
+                    RunStarted(
+                        config.run_dir.name,
+                        config.courts,
+                        phases,
+                        _est_requests_resume(dict(counts)),
+                    )
+                )
                 run_metadata(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                    config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
                 )
                 run_downloads(
-                    config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                    config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
                 )
+                reporter.emit(_run_finished(repo))
         except RunLocked as exc:
             err_console.print(f"[yellow]{exc}[/]")
             raise typer.Exit(code=1) from exc
@@ -615,14 +687,24 @@ def update_cmd(
     _confirm_update(config, preview, revalidate=revalidate, yes=yes, out=msg)
 
     cancel = install_cancel_handler()
-    out = _engine_console(state, json_out=json_out)
+    reporter = _build_reporter(state, config, json_out=json_out)
     new_rows = 0
     revisions = 0
     try:
-        with run_lock(config.run_dir), Repository(config.db_path) as repo:
+        with reporter, run_lock(config.run_dir), Repository(config.db_path) as repo:
+            fetcher.set_reporter(reporter)
             before = repo.counts()["total"]
+            phases = (PHASE_LISTING, PHASE_METADATA, PHASE_DOWNLOADS) + (
+                (PHASE_REVALIDATE,) if revalidate else ()
+            )
+            # The re-list dominates a no-change update; add the full re-fetch when
+            # --revalidate re-downloads every stored PDF.
+            est = preview.total_pages + (
+                repo.counts()["download_done"] if revalidate else 0
+            )
+            reporter.emit(RunStarted(config.run_dir.name, config.courts, phases, est))
             try:
-                run_listing(config, fetcher, repo, preview=preview, console=out)
+                run_listing(config, fetcher, repo, preview=preview, reporter=reporter)
             except httpx.HTTPError:
                 msg.print(
                     "[yellow]Site became unavailable during listing; stopped "
@@ -634,14 +716,15 @@ def update_cmd(
             # already-full run as partial.
             finalize_listing(config, preview)
             new_rows = repo.counts()["total"] - before
-            msg.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
 
-            run_metadata(config, fetcher, repo, cancel=cancel, limit=limit, console=out)
+            run_metadata(
+                config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
+            )
             # Timestamp before downloading so revalidate skips the rows this same
             # run is about to fetch (they need no immediate re-check).
             fetched_before = datetime.now(UTC).isoformat()
             run_downloads(
-                config, fetcher, repo, cancel=cancel, limit=limit, console=out
+                config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
             )
             if revalidate:
                 revisions = revalidate_downloads(
@@ -651,11 +734,15 @@ def update_cmd(
                     cancel=cancel,
                     limit=limit,
                     fetched_before=fetched_before,
-                    console=out,
+                    reporter=reporter,
                 )
+            reporter.emit(_run_finished(repo))
     except RunLocked as exc:
         msg.print(f"[yellow]{exc}[/]")
         raise typer.Exit(code=1) from exc
+
+    # Reported after the live display has closed so it never interleaves a frame.
+    msg.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
 
     with Repository(config.db_path) as repo:
         errors = repo.counts()["download_error"]
@@ -1005,11 +1092,30 @@ def _print_status(config: RunConfig) -> None:
 
 
 def _print_status_table(run_name: str, counts: dict[str, int]) -> None:
+    """Print a human-readable run summary (not a raw dump of status keys)."""
+    total = counts["total"]
+    meta_ok = counts["meta_ok"]
     table = Table(title=f"Run status: {run_name}")
-    table.add_column("Metric")
-    table.add_column("Count", justify="right")
-    for key, value in counts.items():
-        table.add_row(key, str(value))
+    table.add_column("Stage")
+    table.add_column("Progress", justify="right")
+
+    meta_note = []
+    if counts["meta_pending"]:
+        meta_note.append(f"{counts['meta_pending']:,} to fetch")
+    if counts["meta_error"]:
+        meta_note.append(f"{counts['meta_error']:,} skipped")
+    table.add_row(
+        "Metadata resolved",
+        f"{meta_ok:,}/{total:,}" + (f"  ({', '.join(meta_note)})" if meta_note else ""),
+    )
+
+    dl_note = (
+        f"  ({counts['download_error']:,} to retry)" if counts["download_error"] else ""
+    )
+    table.add_row(
+        "PDFs downloaded",
+        f"{counts['download_done']:,}/{meta_ok:,}{dl_note}",
+    )
     console.print(table)
 
 

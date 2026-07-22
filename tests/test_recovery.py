@@ -1,6 +1,6 @@
 import httpx
-from rich.console import Console
 
+from courts_scraper.progress import QuietReporter
 from courts_scraper.recovery import OutageBreaker, Outcome
 
 
@@ -35,7 +35,7 @@ def _raise_timeout() -> None:
 
 def _breaker(fetcher, sleeps, **kwargs) -> OutageBreaker:
     return OutageBreaker(
-        fetcher, "https://x/", Console(), sleep=sleeps.append, **kwargs
+        fetcher, "https://x/", QuietReporter(), sleep=sleeps.append, **kwargs
     )
 
 

@@ -104,6 +104,7 @@ class ProgressModel:
 
         self._run_name = ""
         self._courts: tuple[str, ...] = ()
+        self._phases: tuple[str, ...] = ()
         self._est_total_requests = 0
         self._phase_name = ""
         self._phase_index = 0
@@ -140,11 +141,17 @@ class ProgressModel:
             if isinstance(event, RunStarted):
                 self._run_name = event.run_name
                 self._courts = event.courts
+                self._phases = event.phases
                 self._est_total_requests = event.est_total_requests
+                self._phase_total = len(event.phases)
             elif isinstance(event, PhaseStarted):
                 self._phase_name = event.phase
-                self._phase_index = event.index
-                self._phase_total = event.total
+                self._phase_index = (
+                    self._phases.index(event.phase) + 1
+                    if event.phase in self._phases
+                    else self._phase_index + 1
+                )
+                self._phase_total = len(self._phases) or self._phase_index
                 self._phase_items = event.items
                 self._phase_done = 0
                 self._current_label = ""

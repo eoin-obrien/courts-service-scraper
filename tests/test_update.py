@@ -11,13 +11,13 @@ from pathlib import Path
 import httpx
 import pytest
 import typer
-from rich.console import Console
 
 from courts_scraper.cli import _confirm_update
 from courts_scraper.db import Repository, open_readonly, read_pdf_versions
 from courts_scraper.download import CancelToken
 from courts_scraper.http import Fetcher
 from courts_scraper.models import JudgmentMeta, ListRow
+from courts_scraper.progress import QuietReporter
 from courts_scraper.query import Court
 from courts_scraper.ratelimit import RateLimiter
 from courts_scraper.run import (
@@ -120,7 +120,7 @@ def test_relist_adds_only_new_rows_and_preserves_existing(tmp_path):
         preview = ListingPreview(
             first_html="", first_rows=[existing, new], total_results=2, last_page=0
         )
-        run_listing(config, _fetcher(), repo, preview=preview, console=Console())
+        run_listing(config, _fetcher(), repo, preview=preview, reporter=QuietReporter())
 
         counts = repo.counts()
         assert counts["total"] == 2  # only the new row was inserted
@@ -142,7 +142,9 @@ def test_download_fetches_only_new_rows(httpx_mock, tmp_path):
         )
 
         httpx_mock.add_response(url=new_url, content=new_bytes)
-        run_downloads(config, _fetcher(), repo, cancel=CancelToken(), console=Console())
+        run_downloads(
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
+        )
 
     # Exactly one download happened -- the done row was not re-fetched.
     requests = httpx_mock.get_requests()
@@ -159,7 +161,7 @@ def test_revalidate_unchanged_skips_and_leaves_provenance(httpx_mock, tmp_path):
 
     with Repository(config.db_path) as repo:
         changed = revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), console=Console()
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
         )
         assert changed == 0
         assert repo.count_revisions() == 0
@@ -181,7 +183,7 @@ def test_revalidate_changed_versions_and_archives_old_bytes(httpx_mock, tmp_path
 
     with Repository(config.db_path) as repo:
         changed = revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), console=Console()
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
         )
         assert changed == 1
         assert repo.count_revisions() == 1
@@ -213,7 +215,7 @@ def test_revalidate_fetch_failure_leaves_row_unchecked(httpx_mock, tmp_path):
 
     with Repository(config.db_path) as repo:
         changed = revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), console=Console()
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
         )
         assert changed == 0
 
@@ -247,7 +249,12 @@ def test_revalidate_limit_checks_least_recently_first(httpx_mock, tmp_path):
 
     with Repository(config.db_path) as repo:
         revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), limit=2, console=Console()
+            config,
+            _fetcher(),
+            repo,
+            cancel=CancelToken(),
+            limit=2,
+            reporter=QuietReporter(),
         )
 
     assert _record(config, 1)["last_revalidated_at"] is not None
@@ -271,7 +278,7 @@ def test_corpus_snapshot_includes_revisions_and_archived_bytes(httpx_mock, tmp_p
     httpx_mock.add_response(url=PDF_URL, content=amended)
     with Repository(config.db_path) as repo:
         revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), console=Console()
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
         )
 
     out = tmp_path / "corpus"
@@ -323,7 +330,7 @@ def test_revalidate_heals_a_missing_live_file(httpx_mock, tmp_path):
 
     with Repository(config.db_path) as repo:
         changed = revalidate_downloads(
-            config, _fetcher(), repo, cancel=CancelToken(), console=Console()
+            config, _fetcher(), repo, cancel=CancelToken(), reporter=QuietReporter()
         )
         assert changed == 0  # not a content change
         assert repo.count_revisions() == 0
@@ -347,7 +354,7 @@ def test_revalidate_skips_rows_fetched_after_cutoff(httpx_mock, tmp_path):
             repo,
             cancel=CancelToken(),
             fetched_before=cutoff,
-            console=Console(),
+            reporter=QuietReporter(),
         )
 
     assert changed == 0

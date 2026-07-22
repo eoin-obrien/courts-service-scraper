@@ -48,11 +48,13 @@ class RunStarted:
 
 @dataclass(frozen=True, slots=True)
 class PhaseStarted:
-    """A crawl phase began (``index``/``total`` are 1-based for display)."""
+    """A crawl phase began with ``items`` work items.
+
+    The phase's 1-based position and the run's phase count are derived by the
+    model from :attr:`RunStarted.phases`, so callers only supply the name and size.
+    """
 
     phase: str
-    index: int
-    total: int
     items: int
 
 

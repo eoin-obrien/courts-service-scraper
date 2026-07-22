@@ -20,9 +20,17 @@ from collections.abc import Callable
 from enum import Enum, auto
 
 import httpx
-from rich.console import Console
 
 from courts_scraper.http import Fetcher
+from courts_scraper.progress import (
+    OutageGaveUp,
+    OutagePaused,
+    OutageProbing,
+    OutageRecovered,
+    ProgressReporter,
+    WaitReason,
+    WaitStarted,
+)
 
 #: Consecutive failures before the site is assumed to be down.
 OUTAGE_THRESHOLD = 3
@@ -47,21 +55,23 @@ class OutageBreaker:
         self,
         fetcher: Fetcher,
         probe_url: str,
-        console: Console,
+        reporter: ProgressReporter,
         *,
         threshold: int = OUTAGE_THRESHOLD,
         intervals: tuple[float, ...] = PROBE_INTERVALS,
         max_outage: float = MAX_OUTAGE_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """Configure the breaker (clock/sleep injectable for tests)."""
         self._fetcher = fetcher
         self._probe_url = probe_url
-        self._console = console
+        self._reporter = reporter
         self._threshold = threshold
         self._intervals = intervals
         self._max_outage = max_outage
         self._sleep = sleep
+        self._monotonic = monotonic
         self._consecutive = 0
 
     def run(self, action: Callable[[], None]) -> tuple[Outcome, Exception | None]:
@@ -91,25 +101,23 @@ class OutageBreaker:
 
     def _wait_for_recovery(self) -> bool:
         """Sleep and probe until the site responds, or the cap is exceeded."""
-        self._console.print(
-            "[yellow]Site appears down. Pausing until it recovers...[/]"
-        )
+        self._reporter.emit(OutagePaused(self._consecutive))
         waited = 0.0
         step = 0
         while waited < self._max_outage:
             interval = self._intervals[min(step, len(self._intervals) - 1)]
             interval = min(interval, self._max_outage - waited)
-            self._console.print(f"  probing again in {int(interval)}s...")
+            self._reporter.emit(OutageProbing(waited, interval))
+            self._reporter.emit(
+                WaitStarted(
+                    WaitReason.OUTAGE_PROBE, interval, self._monotonic() + interval
+                )
+            )
             self._sleep(interval)
             waited += interval
             step += 1
             if self._fetcher.is_up(self._probe_url):
-                self._console.print(
-                    f"[green]Site is back after ~{int(waited)}s. Resuming.[/]"
-                )
+                self._reporter.emit(OutageRecovered(waited))
                 return True
-        self._console.print(
-            "[red]Site still down after the outage cap; stopping. "
-            "Resume later with `courts-scraper fetch --latest`.[/]"
-        )
+        self._reporter.emit(OutageGaveUp(waited))
         return False
