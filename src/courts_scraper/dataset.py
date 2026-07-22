@@ -48,8 +48,49 @@ DERIVE_VERSION = 1
 # anything outside is flagged as drift (not rejected) so new labels get noticed
 # and codified here rather than silently accepted. Extend as the corpus surfaces
 # more values -- do not guess entries that have not been observed.
-STATUS_VOCAB: frozenset[str] = frozenset({"Approved"})
-RESULT_VOCAB: frozenset[str] = frozenset({"Allow Appeal"})
+#
+# Status is a genuine two-value vocabulary in the source (a judgment is
+# ``Approved`` or ``Unapproved``); both are observed across the crawled corpus.
+STATUS_VOCAB: frozenset[str] = frozenset({"Approved", "Unapproved"})
+# ``Result`` is only loosely controlled: staff usually pick a standard label but
+# sometimes type a bespoke sentence, and the standard labels vary in case and
+# trailing punctuation. So the check is done against a *normalised* form (see
+# :func:`_normalize`), and this set holds the recurring canonical labels observed
+# across the corpus. A genuinely bespoke result (a free-text sentence, or a new
+# standard label) still falls outside and is flagged -- that is the intended
+# drift signal. Entries are the human-readable canonical spelling; matching is
+# case- and trailing-punctuation-insensitive.
+RESULT_VOCAB: frozenset[str] = frozenset(
+    {
+        "Allow",
+        "Allow Appeal",
+        "Appeal allowed",
+        "Appeal dismissed",
+        "Dismiss",
+        "Dismiss Appeal",
+        "Dismissed",
+        "Other",
+        "Refuse",
+        "Referral to the Court of Justice of the EU",
+    }
+)
+
+
+def _normalize(value: str) -> str:
+    """Fold a label to its comparison form: trimmed, no trailing '.', case-folded.
+
+    Collapses the incidental variation the source introduces (``"Appeal dismissed."``
+    vs ``"Appeal dismissed"`` vs ``"ALLOW APPEAL"``) so a controlled-vocabulary
+    check turns on the label's meaning, not its typography. Word-level differences
+    (``"Allow"`` vs ``"Allow Appeal"``) are preserved -- those are distinct labels.
+    """
+    return value.strip().rstrip(" .").casefold()
+
+
+# Normalised indexes used for the actual membership check (the public *_VOCAB
+# sets stay human-readable for callers and docs).
+_STATUS_NORMALIZED: frozenset[str] = frozenset(_normalize(v) for v in STATUS_VOCAB)
+_RESULT_NORMALIZED: frozenset[str] = frozenset(_normalize(v) for v in RESULT_VOCAB)
 
 _PANEL_DELIMITER = ";"
 
@@ -94,14 +135,17 @@ def _split_panel(composition: str | None) -> tuple[str, ...]:
 
 
 def _check_vocab(
-    value: str | None, vocab: frozenset[str], label: str
+    value: str | None, normalized_vocab: frozenset[str], label: str
 ) -> tuple[bool, str | None]:
-    """Return ``(in_vocab, flag)`` for ``value`` against ``vocab``.
+    """Return ``(in_vocab, flag)`` for ``value`` against a normalised vocabulary.
 
     A ``None`` value (field absent) is in-vocab with no flag -- absence is not
-    drift. A present, unknown value is out-of-vocab and produces a flag string.
+    drift. Otherwise the value is normalised (:func:`_normalize`) before the
+    membership test, so case and trailing-punctuation variants of a known label
+    are accepted; a present value whose normalised form is unknown is out-of-vocab
+    and produces a flag string quoting the original.
     """
-    if value is None or value in vocab:
+    if value is None or _normalize(value) in normalized_vocab:
         return True, None
     return False, f"{label} not in controlled vocabulary: {value!r}"
 
@@ -117,8 +161,8 @@ def derive(row: RowLike) -> Derived:
 
     status = _as_str(row["status_field"])
     result = _as_str(row["result"])
-    status_ok, status_flag = _check_vocab(status, STATUS_VOCAB, "status")
-    result_ok, result_flag = _check_vocab(result, RESULT_VOCAB, "result")
+    status_ok, status_flag = _check_vocab(status, _STATUS_NORMALIZED, "status")
+    result_ok, result_flag = _check_vocab(result, _RESULT_NORMALIZED, "result")
     flags = tuple(f for f in (status_flag, result_flag) if f is not None)
 
     return Derived(

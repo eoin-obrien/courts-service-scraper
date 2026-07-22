@@ -64,17 +64,39 @@ def test_in_vocab_values_have_no_flags():
 
 
 def test_out_of_vocab_status_is_flagged_not_dropped():
-    d = derive(_raw(status_field="Unapproved"))
-    assert d.status == "Unapproved"  # emitted as-is
+    # "Withdrawn" is not an observed Status value; a genuinely-unknown label must
+    # still be emitted as-is and flagged (never dropped). "Unapproved" is now a
+    # known value (see STATUS_VOCAB), so it is no longer a drift example.
+    d = derive(_raw(status_field="Withdrawn"))
+    assert d.status == "Withdrawn"  # emitted as-is
     assert d.status_in_vocab is False
-    assert any("status" in f and "Unapproved" in f for f in d.flags)
+    assert any("status" in f and "Withdrawn" in f for f in d.flags)
+
+
+def test_known_unapproved_status_is_in_vocab():
+    d = derive(_raw(status_field="Unapproved"))
+    assert d.status == "Unapproved"
+    assert d.status_in_vocab is True
+    assert all("status" not in f for f in d.flags)
 
 
 def test_out_of_vocab_result_is_flagged():
-    d = derive(_raw(result="Dismiss Appeal"))
-    assert d.result == "Dismiss Appeal"
+    # A bespoke free-text result (not a canonical label) is emitted as-is and
+    # flagged -- the intended drift signal for the loosely-controlled field.
+    bespoke = "Stay granted on undertaking pending the outcome of the reference"
+    d = derive(_raw(result=bespoke))
+    assert d.result == bespoke
     assert d.result_in_vocab is False
     assert any("result" in f for f in d.flags)
+
+
+def test_result_case_and_punctuation_variants_are_in_vocab():
+    # Normalisation collapses incidental typography onto the canonical label.
+    for variant in ("Appeal dismissed.", "ALLOW APPEAL", "  Dismiss  ", "Other."):
+        d = derive(_raw(result=variant))
+        assert d.result == variant  # raw value preserved verbatim
+        assert d.result_in_vocab is True, variant
+        assert all("result" not in f for f in d.flags), variant
 
 
 def test_absent_status_is_not_drift():
