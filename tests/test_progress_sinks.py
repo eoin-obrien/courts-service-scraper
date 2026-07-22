@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import io
 import threading
+from types import SimpleNamespace
 
-from rich.console import Console, RenderableType
+from rich.console import Console
 
 from courts_scraper.progress import (
     Cancelled,
@@ -15,6 +16,7 @@ from courts_scraper.progress import (
     OutageGaveUp,
     OutagePaused,
     OutageProbing,
+    OutageRecovered,
     PhaseStarted,
     ProgressModel,
     QuietReporter,
@@ -28,8 +30,11 @@ from courts_scraper.progress.dashboard import (
     ASCII,
     UNICODE,
     LiveDashboardReporter,
+    _countdown_text,
+    _eta_text,
+    _TrailerColumn,
     glyphs_for,
-    render_dashboard,
+    scroll_line_for,
 )
 from courts_scraper.progress.plain import PlainReporter
 from courts_scraper.progress.reporter import ProgressReporter
@@ -37,16 +42,12 @@ from courts_scraper.progress.select import LiveDashboardReporter as _Live
 from courts_scraper.progress.select import select_reporter
 
 
-def _text(renderable: RenderableType) -> str:
-    console = Console(file=io.StringIO(), width=100)
-    console.print(renderable)
-    return console.file.getvalue()  # type: ignore[attr-defined]
+class _MutClock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
 
-
-def _render(model: ProgressModel, *, now: float = 0.0) -> str:
-    return _text(
-        render_dashboard(model.snapshot(), glyphs=UNICODE, now=now, clamp=0.15)
-    )
+    def __call__(self) -> float:
+        return self.t
 
 
 # -- glyphs ----------------------------------------------------------------
@@ -57,95 +58,182 @@ def test_glyphs_for_picks_unicode_then_ascii():
     assert glyphs_for(None) is ASCII
 
 
-# -- dashboard states ------------------------------------------------------
-def test_eta_is_rendered_prominently():
+# -- scroll_line_for (the curated "what scrolls" policy) -------------------
+def test_scroll_line_notable_events_produce_lines():
+    g = UNICODE
+    assert scroll_line_for(
+        RunStarted("run-x", ("Supreme Court",), ("listing",), 10), g
+    ).endswith("run-x")
+    assert (
+        scroll_line_for(PhaseStarted("downloads", 2712), g) == "-- downloads 2,712 --"
+    )
+    assert "skipped" in scroll_line_for(
+        ItemFinished("m", ItemStatus.SKIPPED_NO_CITATION, "In re Estate"), g
+    )
+    assert "error" in scroll_line_for(ItemFinished("m", ItemStatus.ERROR, "boom"), g)
+    assert (
+        "retry"
+        in scroll_line_for(ItemFinished("d", ItemStatus.DEFERRED, "flaky"), g).lower()
+    )
+    assert scroll_line_for(OutagePaused(3), g) is not None
+    assert scroll_line_for(OutageProbing(60.0, 120.0), g) is not None
+    assert scroll_line_for(OutageRecovered(240.0), g) is not None
+    assert scroll_line_for(OutageGaveUp(3600.0), g) is not None
+    assert scroll_line_for(Cancelled("downloads"), g) is not None
+    assert "complete" in scroll_line_for(
+        RunFinished({"download_done": 5}, 10.0, incomplete=False), g
+    )
+
+
+def test_scroll_line_noisy_events_are_silent():
+    g = UNICODE
+    # These carry the bars, not the scroll log -- no per-item / per-request spam.
+    assert scroll_line_for(ItemFinished("m", ItemStatus.OK), g) is None
+    assert scroll_line_for(ItemStarted("m", "[2026] IESC 1", "u"), g) is None
+    assert scroll_line_for(RequestStarted("u"), g) is None
+    assert scroll_line_for(WaitStarted(WaitReason.POLITENESS, 6.0, 100.0), g) is None
+
+
+# -- countdown / eta columns ----------------------------------------------
+def _snap_waiting(until: float):
+    model = ProgressModel(delay=5.0, jitter=1.0)
+    model.apply(WaitStarted(WaitReason.POLITENESS, 6.0, until))
+    return model.snapshot()
+
+
+def test_countdown_animates_and_never_shows_zero():
+    snap = _snap_waiting(100.0)
+    assert "3.0s" in _countdown_text(snap, 97.0, 0.15, UNICODE)
+    assert "1.0s" in _countdown_text(snap, 99.0, 0.15, UNICODE)
+    near_zero = _countdown_text(snap, 99.99, 0.15, UNICODE)
+    assert "0.0s" not in near_zero
+    assert "requesting" in near_zero
+
+
+def test_countdown_shows_request_in_flight_and_outage():
+    model = ProgressModel(delay=5.0, jitter=1.0)
+    model.apply(RequestStarted("u"))
+    assert "flight" in _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
+    model.apply(OutagePaused(3))
+    # Paused but not yet probing: no probe countdown is armed, so it must not
+    # claim "probing 0s".
+    paused = _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
+    assert "site down" in paused and "probing" not in paused
+    model.apply(OutageProbing(60.0, 118.0))
+    assert "probing" in _countdown_text(model.snapshot(), 0.0, 0.15, UNICODE)
+
+
+def test_eta_text_states():
     model = ProgressModel(
         delay=5.0, jitter=2.0, monotonic=lambda: 0.0, wall=lambda: 0.0
     )
-    model.apply(RunStarted("run", ("Supreme Court",), ("downloads",), 100))
-    out = _render(model)
-    assert "ETA" in out
-    assert "Overall" in out
+    model.apply(RunStarted("r", (), ("downloads",), 100))
+    assert _eta_text(model.snapshot()).startswith("ETA ")
+    model.apply(RunFinished({}, 1.0, incomplete=False))
+    assert _eta_text(model.snapshot()) == "complete"
 
 
-def test_countdown_clamps_near_zero_and_never_shows_zero():
-    model = ProgressModel(delay=5.0, jitter=1.0)
-    model.apply(ItemStarted("downloads", "[2026] IESC 1", "u"))
-    model.apply(WaitStarted(WaitReason.POLITENESS, 6.0, 100.0))
-    # 3s out: a live countdown.
-    assert "3.0s" in _render(model, now=97.0)
-    # Within a frame of zero: the transitional state, never "0.0s".
-    near_zero = _render(model, now=99.99)
-    assert "0.0s" not in near_zero
-    assert "requesting" in near_zero
-    # Request in flight (RequestStarted cleared the wait).
-    model.apply(RequestStarted("u"))
-    flight = _render(model, now=100.0)
-    assert "0.0s" not in flight
-    assert "flight" in flight
+# -- LiveDashboardReporter integration (record=True + export_text) ---------
+def _record_console() -> Console:
+    return Console(file=io.StringIO(), record=True, force_terminal=True, width=100)
 
 
-def test_outage_banner_replaces_now_line():
-    model = ProgressModel(delay=5.0, jitter=1.0)
-    model.apply(RunStarted("run", (), ("downloads",), 100))
-    model.apply(ItemStarted("downloads", "some.pdf", "u"))
-    model.apply(OutagePaused(3))
-    model.apply(OutageProbing(60.0, 120.0))
-    out = _render(model)
-    assert "PAUSED" in out
-    assert "some.pdf" not in out  # the Now line is suppressed while paused
+def test_dashboard_renders_bars_and_curated_lines():
+    console = _record_console()
+    with LiveDashboardReporter(console, delay=5.0, jitter=1.0) as reporter:
+        reporter.emit(
+            RunStarted("20260722T__supreme", ("Supreme Court",), ("downloads",), 10)
+        )
+        reporter.emit(PhaseStarted("downloads", 5))
+        for i in range(5):
+            reporter.emit(ItemStarted("downloads", f"[2026] IESC {i}", "u"))
+            reporter.emit(RequestStarted("u"))
+            reporter.emit(ItemFinished("downloads", ItemStatus.OK))
+        reporter.emit(
+            ItemFinished("downloads", ItemStatus.SKIPPED_NO_CITATION, "No cite")
+        )
+        reporter.emit(
+            RunFinished(
+                {"download_done": 5, "download_error": 0}, 3.0, incomplete=False
+            )
+        )
+    text = console.export_text()
+    assert "overall" in text  # the overall bar
+    assert "downloads" in text  # the phase bar / header
+    assert "-- downloads 5 --" in text  # phase header scrolled
+    assert "skipped: No cite" in text  # curated skip line
+    assert "run complete" in text  # final summary
 
 
-def test_all_states_render_without_error():
-    # A battery of crafted states; each must render to non-empty text.
-    states: list[ProgressModel] = []
-
-    def fresh() -> ProgressModel:
-        return ProgressModel(delay=5.0, jitter=1.0)
-
-    startup = fresh()
-    startup.apply(RunStarted("r", ("Supreme Court",), ("listing", "metadata"), 50))
-    states.append(startup)
-
-    listing_unknown = fresh()
-    listing_unknown.apply(RunStarted("r", (), ("listing",), 0))
-    listing_unknown.apply(PhaseStarted("listing", 0))  # unknown total
-    listing_unknown.apply(ItemStarted("listing", "page 1", ""))
-    states.append(listing_unknown)
-
-    single = fresh()
-    single.apply(RunStarted("r", (), ("downloads",), 1))
-    single.apply(PhaseStarted("downloads", 1))
-    states.append(single)
-
-    zero = fresh()
-    zero.apply(RunStarted("r", (), ("downloads",), 0))
-    zero.apply(PhaseStarted("downloads", 0))
-    states.append(zero)
-
-    cancelled = fresh()
-    cancelled.apply(RunStarted("r", (), ("downloads",), 5))
-    cancelled.apply(Cancelled("downloads"))
-    states.append(cancelled)
-
-    gave_up = fresh()
-    gave_up.apply(RunStarted("r", (), ("downloads",), 5))
-    gave_up.apply(OutageGaveUp(3600.0))
-    states.append(gave_up)
-
-    completed = fresh()
-    completed.apply(RunStarted("r", (), ("downloads",), 5))
-    completed.apply(RunFinished({"download_done": 5}, 10.0, incomplete=False))
-    states.append(completed)
-
-    for model in states:
-        assert _render(model).strip() != ""
+def _two_bar_rows_at_80(est_total, phase_items, delay, done, title):
+    # Drive a reporter to a realistic mid-run state and render ONE clean frame of
+    # the two pinned bars (not the live session, whose export_text glues frames --
+    # the spike's capture caveat), returning the non-blank physical rows.
+    work = Console(file=io.StringIO(), force_terminal=True, width=80)
+    reporter = LiveDashboardReporter(
+        work, delay=delay, jitter=0.0, monotonic=lambda: 0.0
+    )
+    courts = ("Supreme Court", "Court of Appeal")
+    reporter.emit(RunStarted("run", courts, ("dl",), est_total))
+    reporter.emit(PhaseStarted("dl", phase_items))
+    for _ in range(done):  # advance both bars so MofN reaches its real width
+        reporter.emit(ItemStarted("dl", "x", "u"))
+        reporter.emit(RequestStarted("u"))
+        reporter.emit(ItemFinished("dl", ItemStatus.OK))
+    reporter.emit(ItemStarted("dl", title, "u"))
+    reporter.emit(WaitStarted(WaitReason.POLITENESS, delay, delay))
+    reporter._sync_bars()
+    frame = Console(file=io.StringIO(), record=True, force_terminal=True, width=80)
+    frame.print(reporter._progress.get_renderable())
+    return [line for line in frame.export_text().splitlines() if line.strip()]
 
 
-def test_render_is_race_free_under_concurrent_mutation():
-    """AC-5: rendering while the engine mutates the model must never raise."""
+def test_dashboard_rows_fit_terminal_width():
+    # AC-9: neither bar may wrap at 80 cols -- the reskin's whole point. The bar
+    # is the flex column (bar_width=None) and the trailer is no_wrap, so a long
+    # citation, a 5-6 digit MofN, or a multi-hour ETA must all clip, not wrap.
+    # Parametrized over realistic wide loads (a single-court run *and* a big
+    # multi-court run) so the pass isn't calibrated to one lucky width.
+    long_title = "[2024] IESC 12 - DPP v. Murphy & Ors (a very long title indeed)"
+    scenarios = [
+        (5_694, 2_712, 5.0, 3, long_title),  # single court
+        (50_000, 41_000, 5.0, 3, long_title),  # multi-court: 5-digit MofN, big ETA
+        (200_000, 150_000, 15.0, 7, long_title),  # extreme: 6-digit MofN, big ETA
+    ]
+    for est_total, phase_items, delay, done, title in scenarios:
+        rows = _two_bar_rows_at_80(est_total, phase_items, delay, done, title)
+        assert len(rows) == 2, (est_total, rows)  # two bars, each one line (no wrap)
+        for line in rows:
+            assert len(line.rstrip()) <= 80, (est_total, repr(line))
+
+
+def test_dashboard_handles_unknown_phase_total():
+    # Listing with an unknown result count -> phase total 0 -> indeterminate bar.
+    console = _record_console()
+    with LiveDashboardReporter(console, delay=5.0, jitter=1.0) as reporter:
+        reporter.emit(RunStarted("r", (), ("listing",), 0))
+        reporter.emit(PhaseStarted("listing", 0))  # unknown total
+        reporter.emit(ItemStarted("listing", "page 1", ""))
+        reporter.emit(ItemFinished("listing", ItemStatus.OK))
+    assert "listing" in console.export_text()  # rendered, no crash
+
+
+def test_dashboard_milestone_heartbeat():
+    console = _record_console()
+    with LiveDashboardReporter(console, delay=0.0, jitter=0.0) as reporter:
+        reporter.emit(RunStarted("r", (), ("downloads",), 1000))
+        reporter.emit(PhaseStarted("downloads", 1000))
+        for _ in range(500):
+            reporter.emit(ItemFinished("downloads", ItemStatus.OK))
+    assert "500 done" in console.export_text()
+
+
+def test_trailer_column_render_is_race_free_under_mutation():
+    """AC-11/H4: the refresh thread's column read must never raise mid-mutation."""
     model = ProgressModel(delay=5.0, jitter=1.0)
     model.apply(RunStarted("r", (), ("downloads",), 1000))
+    column = _TrailerColumn(model, clamp=0.15, glyphs=UNICODE, monotonic=lambda: 0.0)
+    task = SimpleNamespace(fields={"kind": "phase"})
     errors: list[BaseException] = []
 
     def worker() -> None:
@@ -159,44 +247,9 @@ def test_render_is_race_free_under_concurrent_mutation():
     t = threading.Thread(target=worker)
     t.start()
     for _ in range(1000):
-        _render(model)
+        column.render(task)  # type: ignore[arg-type]
     t.join()
     assert errors == []
-
-
-def test_live_dashboard_reporter_enter_emit_exit():
-    console = Console(file=io.StringIO(), force_terminal=True, width=100)
-    with LiveDashboardReporter(console, delay=5.0, jitter=1.0) as reporter:
-        reporter.emit(RunStarted("run", ("Supreme Court",), ("downloads",), 10))
-        reporter.emit(ItemStarted("downloads", "a.pdf", "u"))
-        reporter.emit(RunFinished({"download_done": 1}, 1.0, incomplete=False))
-    # A frame was drawn and the terminal control sequences were emitted/closed.
-    assert console.file.getvalue() != ""  # type: ignore[attr-defined]
-
-
-class _MutClock:
-    def __init__(self, t: float = 1000.0) -> None:
-        self.t = t
-
-    def __call__(self) -> float:
-        return self.t
-
-
-def test_live_renderable_recomputes_each_call_so_countdown_animates():
-    # The refresh thread calls get_renderable (== _renderable) every tick with NO
-    # new event; it must reflect the current clock, or the countdown freezes.
-    clock = _MutClock()
-    console = Console(file=io.StringIO(), force_terminal=True, width=80)
-    reporter = LiveDashboardReporter(console, delay=5.0, jitter=0.0, monotonic=clock)
-    reporter._model.apply(ItemStarted("downloads", "x", "u"))
-    reporter._model.apply(WaitStarted(WaitReason.POLITENESS, 5.0, 1005.0))
-    clock.t = 1002.0
-    first = _text(reporter._renderable())
-    clock.t = 1004.0
-    second = _text(reporter._renderable())
-    assert "3.0s" in first
-    assert "1.0s" in second
-    assert first != second
 
 
 # -- plain sink ------------------------------------------------------------
