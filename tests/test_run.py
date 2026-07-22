@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from courts_scraper.query import Court, search_url
@@ -58,6 +60,9 @@ def test_preview_listing_reports_scale(httpx_mock, search_html, tmp_path):
     assert preview.last_page == 25
     assert preview.total_pages == 26
     assert len(preview.first_rows) == 100
+    # No cap => the full crawl, not truncated.
+    assert preview.pages_available == 26
+    assert preview.truncated is False
 
 
 def test_preview_listing_respects_max_pages(httpx_mock, search_html, tmp_path):
@@ -70,6 +75,226 @@ def test_preview_listing_respects_max_pages(httpx_mock, search_html, tmp_path):
 
     assert preview.last_page == 0
     assert preview.total_pages == 1
+    # The uncapped size is preserved so truncation is detectable.
+    assert preview.pages_available == 26
+    assert preview.max_pages == 1
+    assert preview.truncated is True
+
+
+def test_preview_listing_max_pages_at_or_above_real_is_not_truncated(
+    httpx_mock, search_html, tmp_path
+):
+    config = _config(tmp_path)
+    httpx_mock.add_response(
+        url=search_url(config.base_url, config.query, page=0), text=search_html
+    )
+
+    # 26 real pages; capping at exactly 26 (boundary) does not cut anything.
+    preview = preview_listing(config, _fetcher(), max_pages=26)
+
+    assert preview.total_pages == 26
+    assert preview.pages_available == 26
+    assert preview.truncated is False
+
+
+def test_finalize_listing_records_truncation(tmp_path):
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)  # writes the creation-time manifest
+
+    preview = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=2,
+        max_pages=3,
+        pages_available=26,
+    )
+    finalize_listing(config, preview)
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    assert block == {
+        "complete": True,
+        "truncated": True,
+        "max_pages": 3,
+        "pages_fetched": 3,
+        "pages_available": 26,
+    }
+
+
+def test_finalize_listing_full_crawl_is_not_truncated(tmp_path):
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+
+    preview = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=25,
+        max_pages=None,
+        pages_available=26,
+    )
+    finalize_listing(config, preview)
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    assert block["complete"] is True
+    assert block["truncated"] is False
+
+
+def test_finalize_listing_clear_only_keeps_prior_full_crawl(tmp_path):
+    """A later capped pass must not un-cover pages an earlier full crawl reached."""
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+
+    full = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=25,
+        max_pages=None,
+        pages_available=26,
+    )
+    finalize_listing(config, full)  # verified full crawl
+
+    capped = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=2,
+        max_pages=3,
+        pages_available=26,
+    )
+    finalize_listing(config, capped)  # a narrow update pass
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    # Coverage is monotonic: the full crawl's verdict survives the capped pass.
+    assert block["truncated"] is False
+    assert block["pages_fetched"] == 26
+
+
+def test_finalize_listing_full_pass_clears_prior_truncation(tmp_path):
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+
+    capped = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=2,
+        max_pages=3,
+        pages_available=26,
+    )
+    finalize_listing(config, capped)  # truncated first
+
+    full = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=25,
+        max_pages=None,
+        pages_available=26,
+    )
+    finalize_listing(config, full)  # then backfilled by a full pass
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    assert block["truncated"] is False
+
+
+def test_finalize_listing_grow_then_cap_is_truncated(tmp_path):
+    """The result set grows between runs; a capped update that no longer reaches
+    the new end must flip a prior full crawl back to truncated (not trust it)."""
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+
+    full = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=26,
+        max_pages=None,
+        pages_available=27,
+    )
+    finalize_listing(config, full)  # verified full crawl of 27 pages
+
+    # Site grew to 40 pages; a capped update re-lists only 30.
+    grown_capped = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=4000,
+        last_page=29,
+        max_pages=30,
+        pages_available=40,
+    )
+    finalize_listing(config, grown_capped)
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    # Covers max(30, 27) = 30 of 40 -> genuinely truncated now.
+    assert block["truncated"] is True
+    assert block["pages_fetched"] == 30
+    assert block["pages_available"] == 40
+
+
+def test_finalize_listing_smaller_cap_does_not_lower_recorded_coverage(tmp_path):
+    """A narrower capped pass over a wider prior one keeps the larger coverage
+    (listing only upserts, so the union is the largest prefix ever fetched)."""
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+
+    wider = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=9,
+        max_pages=10,
+        pages_available=27,
+    )
+    finalize_listing(config, wider)  # truncated at 10/27
+
+    narrower = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=4,
+        max_pages=5,
+        pages_available=27,
+    )
+    finalize_listing(config, narrower)  # a narrower 5-page pass
+
+    block = json.loads(config.manifest_path.read_text(encoding="utf-8"))["listing"]
+    assert block["truncated"] is True
+    assert block["pages_fetched"] == 10  # not lowered to 5
+
+
+def test_finalize_listing_writes_atomically_no_temp_left(tmp_path):
+    from courts_scraper.run import ListingPreview, finalize_listing, materialize_run
+
+    config = _config(tmp_path)
+    materialize_run(config)
+    preview = ListingPreview(
+        first_html="",
+        first_rows=[],
+        total_results=2561,
+        last_page=2,
+        max_pages=3,
+        pages_available=26,
+    )
+    finalize_listing(config, preview)
+
+    # The manifest is valid JSON and no .tmp scratch file is left behind.
+    json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    leftovers = list(config.run_dir.glob("manifest.json.*.tmp"))
+    assert leftovers == []
 
 
 def test_download_rejects_tampered_filename(tmp_path):
@@ -192,8 +417,6 @@ def test_build_run_config_does_not_touch_disk(tmp_path):
 
 
 def test_manifest_records_custom_user_agent(tmp_path):
-    import json
-
     from courts_scraper.run import materialize_run
 
     config = build_run_config(

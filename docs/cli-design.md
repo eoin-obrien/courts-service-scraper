@@ -93,9 +93,25 @@ Flags: `-c/--court`, `--run-dir`, `--latest`, `--list-only`, `--limit`,
 > **Listing-resume limitation (v1).** The engine tracks download progress, not a
 > listing cursor, so an interrupted *listing* phase restarts on the next `fetch`
 > (listing is treated as atomic); resume applies to the metadata+download phase.
-> Documented so "resume = run it again" isn't oversold. Clean fix (fast-follow): add
-> a `listing_complete` bool to the manifest — a one-field change if we decide to
-> honor mid-listing resume later.
+> Documented so "resume = run it again" isn't oversold.
+>
+> **Listing completeness is now recorded (fast-follow, shipped).** After a listing
+> pass finishes, the manifest gains a `listing` block —
+> `{complete, truncated, max_pages, pages_fetched, pages_available}` — written
+> atomically by `finalize_listing` *after* `run_listing` returns, so an interrupted
+> listing leaves the block absent (honestly "not verified complete") rather than
+> claiming a full crawl. `truncated` means the run covers fewer pages than the site
+> currently advertises. Coverage is the largest contiguous prefix ever fetched
+> (`max` of this pass and the prior recorded one, since listing only upserts), judged
+> against *this* pass's `pages_available` — which the result set can outgrow between
+> runs. So a prior full crawl does not stay "full" once the site grows and a capped
+> `update` no longer reaches the new end; the verdict is recomputed, not trusted. The
+> flag flows into the `fetch` duplicate-run guard, `runs`' summary/`--json`,
+> single-run `export` descriptors, and the corpus `snapshot.json`, where per-run
+> `listing.sources` is authoritative (no single corpus-level completeness boolean is
+> claimed across differing court sets; `all_verified` and `any_truncated` are the
+> only exact aggregates). This records the *fact* of incompleteness; actually
+> resuming a truncated listing from a cursor is still the larger follow-up.
 
 **`update`** — pull newly-published judgments into a complete run. Kept as its own
 command *on purpose*: its cost profile (incremental, plus the loud `--revalidate`

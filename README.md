@@ -203,7 +203,8 @@ under fixity). Reserve it for a slower cadence than the incremental `update`.
 ```
 data/
   20260720T231500Z__supreme/
-    manifest.json        # search query, courts, start time, tool version
+    manifest.json        # search query, courts, start time, tool version,
+                         #   and listing completeness (--max-pages truncation)
     judgments.sqlite     # all metadata + the per-document PDF version history
     pdfs/                # downloaded judgment PDFs (latest version of each)
       versions/          # superseded PDF versions, named by sha256 (revalidate)

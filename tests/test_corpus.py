@@ -21,10 +21,14 @@ def _make_run(
     pdf_bytes=b"%PDF-1.7 body",
     downloaded=True,
     write_pdf=True,
+    listing=None,
 ):
     path.mkdir(parents=True, exist_ok=True)
+    manifest = {"base_url": "https://ww2.courts.ie", "courts": ["Supreme Court"]}
+    if listing is not None:
+        manifest["listing"] = listing
     (path / "manifest.json").write_text(
-        json.dumps({"base_url": "https://ww2.courts.ie", "courts": ["Supreme Court"]}),
+        json.dumps(manifest),
         encoding="utf-8",
     )
     with Repository(path / "judgments.sqlite") as repo:
@@ -165,6 +169,74 @@ def test_snapshot_records_runs_and_conflicts(tmp_path):
     assert snap["record_count"] == 1
     assert snap["conflicts"][0]["document_uuid"] == "d1"
     assert len(result.conflicts) == 1
+
+
+def test_snapshot_listing_sources_are_authoritative(tmp_path):
+    """Per-run 'sources' carries the truth; only exactly-correct aggregates ship."""
+    full = {
+        "complete": True,
+        "truncated": False,
+        "max_pages": None,
+        "pages_fetched": 26,
+        "pages_available": 26,
+    }
+    capped = {
+        "complete": True,
+        "truncated": True,
+        "max_pages": 3,
+        "pages_fetched": 3,
+        "pages_available": 26,
+    }
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", listing=full)
+    r2 = _make_run(tmp_path / "run2", uuid="d2", sha="bbb", listing=capped)
+    bag = tmp_path / "bag"
+    build_corpus([r1, r2], bag, formats=("csv",))
+
+    listing = json.loads((bag / "data" / "snapshot.json").read_text(encoding="utf-8"))[
+        "listing"
+    ]
+    # No misleading corpus-level "complete/truncated" boolean is emitted.
+    assert "truncated" not in listing
+    assert "any_full_crawl" not in listing
+    # Per-source truth survives, and the two correct aggregates hold.
+    assert listing["sources"]["run1"]["truncated"] is False
+    assert listing["sources"]["run2"]["truncated"] is True
+    assert listing["all_verified"] is True
+    assert listing["any_truncated"] is True
+
+
+def test_snapshot_listing_all_full_sources_not_truncated(tmp_path):
+    full = {
+        "complete": True,
+        "truncated": False,
+        "max_pages": None,
+        "pages_fetched": 26,
+        "pages_available": 26,
+    }
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa", listing=full)
+    bag = tmp_path / "bag"
+    build_corpus([r1], bag, formats=("csv",))
+
+    listing = json.loads((bag / "data" / "snapshot.json").read_text(encoding="utf-8"))[
+        "listing"
+    ]
+    assert listing["all_verified"] is True
+    assert listing["any_truncated"] is False
+
+
+def test_snapshot_listing_unverified_source_not_flagged_truncated(tmp_path):
+    """A pre-feature run with no listing block reads as unverified, never truncated."""
+    r1 = _make_run(tmp_path / "run1", uuid="d1", sha="aaa")  # no listing block
+    bag = tmp_path / "bag"
+    build_corpus([r1], bag, formats=("csv",))
+
+    listing = json.loads((bag / "data" / "snapshot.json").read_text(encoding="utf-8"))[
+        "listing"
+    ]
+    assert listing["sources"]["run1"] == {"verified": False}
+    assert listing["all_verified"] is False
+    # Unverified is not full, but must NOT be reported as truncated either.
+    assert listing["any_truncated"] is False
 
 
 def test_missing_pdf_is_surfaced_not_hidden(tmp_path):

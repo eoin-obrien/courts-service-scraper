@@ -202,9 +202,16 @@ def test_runs_json(make_run_dir, tmp_path):
         "error",
         "readable",
         "complete",
+        "listing_verified",
+        "listing_truncated",
+        "pages_fetched",
+        "pages_available",
         "path",
     }
     assert row["name"] == "20260101T000000Z__supreme"
+    # A run built without a listing block reads as unverified, not truncated.
+    assert row["listing_verified"] is False
+    assert row["listing_truncated"] is False
     assert row["total"] == 2 and row["done"] == 1 and row["complete"] is False
 
 
@@ -326,6 +333,61 @@ def test_fetch_list_only_new_run_records_and_breadcrumbs(
     # A run folder with a database exists, and no PDFs were downloaded.
     runs = [p for p in data.iterdir() if (p / "judgments.sqlite").is_file()]
     assert len(runs) == 1
+
+
+def test_truncated_run_does_not_block_a_new_fetch(
+    httpx_mock, search_html, make_run_dir, tmp_path
+):
+    """A fully-downloaded but --max-pages-truncated run is not a canonical crawl,
+    so a later real fetch for the same court must not be refused as 'complete'."""
+    from courts_scraper.query import Court, build_query, search_url
+    from courts_scraper.run import DEFAULT_BASE_URL
+
+    data = tmp_path / "data"
+    # Pre-existing run: downloads complete, but the listing was capped.
+    make_run_dir(
+        data,
+        "20260101T000000Z__supreme",
+        done=1,
+        total=1,
+        listing={
+            "complete": True,
+            "truncated": True,
+            "max_pages": 1,
+            "pages_fetched": 1,
+            "pages_available": 26,
+        },
+    )
+
+    page0 = search_url(DEFAULT_BASE_URL, build_query((Court.SUPREME,)), page=0)
+    httpx_mock.add_response(url=page0, text=search_html)
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data),
+            "fetch",
+            "-c",
+            "supreme",
+            "--list-only",
+            "--max-pages",
+            "1",
+            "--delay",
+            "0",
+            "--jitter",
+            "0",
+            "--yes",
+        ],
+        env=_WIDE_ENV,
+    )
+    out = _clean(result.output)
+    assert result.exit_code == 0, out
+    # Not refused as an existing complete run...
+    assert "already exists" not in out
+    # ...and a second run folder was created.
+    runs = [p for p in data.iterdir() if (p / "judgments.sqlite").is_file()]
+    assert len(runs) == 2
 
 
 # --- export / corpus --json (no network) ----------------------------------

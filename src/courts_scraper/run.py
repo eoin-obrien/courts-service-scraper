@@ -14,6 +14,7 @@ Everything here is resume-safe: rerunning a phase only does outstanding work.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sqlite3
 from collections.abc import Iterator
@@ -187,6 +188,27 @@ def _prepare_dirs(config: RunConfig) -> None:
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _write_json_atomic(path: Path, obj: object) -> None:
+    """Write ``obj`` as pretty JSON to ``path`` atomically.
+
+    A plain ``write_text`` truncates the file first, so a crash or full disk
+    mid-write leaves a torn manifest -- which the next resume/update reads with a
+    raw ``json.loads`` and dies on. Write to a sibling temp file, fsync, then
+    ``os.replace`` (atomic on POSIX and Windows) so readers only ever see the old
+    or the new whole file.
+    """
+    text = json.dumps(obj, indent=2, ensure_ascii=False)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)  # atomic on POSIX and Windows
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _write_manifest(config: RunConfig) -> None:
     manifest = {
         "tool": "courts-scraper",
@@ -199,9 +221,58 @@ def _write_manifest(config: RunConfig) -> None:
         "jitter": config.jitter,
         "user_agent": config.user_agent,
     }
-    config.manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _write_json_atomic(config.manifest_path, manifest)
+
+
+def finalize_listing(config: RunConfig, preview: ListingPreview) -> None:
+    """Stamp the manifest with the completeness of the listing that just finished.
+
+    Called *after* :func:`run_listing` returns (not at run creation), so the block
+    reflects the crawl that actually landed on disk. An interrupted or errored
+    listing never reaches here, so the block stays absent -- which readers must
+    treat as "not verified complete", never as "full".
+
+    The block records ``complete`` (the listing pass finished), ``truncated``
+    (the run covers fewer pages than the site currently advertises), and the page
+    counts behind that verdict.
+
+    **Coverage is the largest prefix ever fetched, judged against the current
+    total.** Every listing pass fetches a contiguous prefix ``[0, total_pages)``
+    from page 0, and :func:`run_listing` only upserts, so the union across passes
+    is ``max(this pass, the prior recorded pass)`` pages. Truncation is then that
+    coverage against *this* pass's ``pages_available`` -- which matters because the
+    result set grows between runs (that is what ``update`` is for). A prior full
+    crawl of 27 pages does NOT stay "full" after the site grows to 40 and a capped
+    ``update`` re-lists only 30; the run genuinely misses pages 30-39, so it is
+    truncated, and this recomputes that rather than trusting the stale verdict.
+    """
+    try:
+        manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    prior_covered = 0
+    previous = manifest.get("listing")
+    if isinstance(previous, dict) and previous.get("complete") is True:
+        prior_pages = previous.get("pages_fetched")
+        if isinstance(prior_pages, int):
+            prior_covered = prior_pages
+
+    # Largest contiguous prefix reached across this pass and any prior one.
+    covered = max(preview.total_pages, prior_covered)
+    available = preview.pages_available
+    truncated = available is not None and covered < available
+
+    manifest["listing"] = {
+        "complete": True,
+        "truncated": truncated,
+        "max_pages": preview.max_pages,
+        "pages_fetched": covered,
+        "pages_available": available,
+    }
+    _write_json_atomic(config.manifest_path, manifest)
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +411,24 @@ class ListingPreview:
     first_rows: list[ListRow]
     total_results: int | None
     last_page: int  # zero-based, already capped by max_pages
+    # Truncation provenance, so a later manifest write can record whether this
+    # crawl was deliberately cut short. ``pages_available`` is the full crawl's
+    # page count *before* the ``max_pages`` cap; ``None`` means "unknown" (e.g. a
+    # synthetic preview in a test) and is treated as "not truncated".
+    max_pages: int | None = None
+    pages_available: int | None = None
 
     @property
     def total_pages(self) -> int:
         """Number of pages that will be fetched (1-based count)."""
         return self.last_page + 1
+
+    @property
+    def truncated(self) -> bool:
+        """Whether ``max_pages`` cut this crawl short of the full result set."""
+        if self.pages_available is None:
+            return False
+        return self.total_pages < self.pages_available
 
 
 def preview_listing(
@@ -379,10 +463,21 @@ def preview_listing(
     if total_results and first_rows:
         pages_from_count = -(-total_results // len(first_rows)) - 1  # ceil - 1
         last_page = max(last_page, pages_from_count)
+    # The full crawl's size, captured after the count cross-check but before any
+    # deliberate cap -- so the manifest can later record whether --max-pages
+    # actually cut the crawl short.
+    pages_available = last_page + 1
     if max_pages is not None:
         last_page = min(last_page, max_pages - 1)
 
-    return ListingPreview(html, first_rows, total_results, last_page)
+    return ListingPreview(
+        html,
+        first_rows,
+        total_results,
+        last_page,
+        max_pages=max_pages,
+        pages_available=pages_available,
+    )
 
 
 def run_listing(
