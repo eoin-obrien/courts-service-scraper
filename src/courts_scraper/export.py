@@ -500,10 +500,17 @@ def export_run(
     manifest = _manifest(run_dir)
     base_url = manifest.get("base_url")
     courts = manifest.get("courts")
+    # Carry listing completeness into the descriptor so a consumer of the package
+    # knows whether the source crawl was full or deliberately truncated.
+    listing = manifest.get("listing")
+    extra: dict[str, object] | None = (
+        {"listing": listing} if isinstance(listing, dict) else None
+    )
     return write_package(
         iter_records(run_dir),
         out_dir,
         formats=formats,
         base_url=base_url if isinstance(base_url, str) else None,
         courts=courts if isinstance(courts, list) else None,
+        extra=extra,
     )

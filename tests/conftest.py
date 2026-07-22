@@ -40,20 +40,25 @@ def make_run_dir():
     from courts_scraper.db import Repository
     from courts_scraper.models import JudgmentMeta, ListRow
 
-    def _make(data_dir, name, *, courts=("Supreme Court",), done=0, total=1):
+    def _make(
+        data_dir, name, *, courts=("Supreme Court",), done=0, total=1, listing=None
+    ):
         run = Path(data_dir) / name
         run.mkdir(parents=True, exist_ok=True)
         # A manifest complete enough for load_run_config (base_url + query), so a
         # run built by this fixture can be resumed/inspected through the CLI.
+        # ``listing`` optionally stamps the completeness block a real run would
+        # write via finalize_listing.
+        manifest = {
+            "courts": list(courts),
+            "created": name,
+            "base_url": BASE_URL,
+            "query": {},
+        }
+        if listing is not None:
+            manifest["listing"] = listing
         (run / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "courts": list(courts),
-                    "created": name,
-                    "base_url": BASE_URL,
-                    "query": {},
-                }
-            ),
+            json.dumps(manifest),
             encoding="utf-8",
         )
         with Repository(run / "judgments.sqlite") as repo:

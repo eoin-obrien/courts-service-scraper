@@ -49,6 +49,7 @@ from courts_scraper.run import (
     RunLocked,
     build_run_config,
     estimate_seconds,
+    finalize_listing,
     format_duration,
     install_cancel_handler,
     load_run_config,
@@ -192,7 +193,8 @@ JitterOption = Annotated[
     float, typer.Option("--jitter", help="Max extra random seconds per request.")
 ]
 MaxPagesOption = Annotated[
-    int | None, typer.Option("--max-pages", help="Cap on search pages (testing).")
+    int | None,
+    typer.Option("--max-pages", help="Cap on search pages (testing).", min=1),
 ]
 LimitOption = Annotated[
     int | None, typer.Option("--limit", help="Cap on PDFs to download (testing).")
@@ -420,8 +422,12 @@ def _fetch_new(
     same-court resume here would double-prompt.
     """
     matches = _matching_runs(state.data_dir, courts)
-    if any(run.is_complete for run in matches):
-        done = next(run for run in matches if run.is_complete)
+    # A run whose listing was truncated by --max-pages is not a canonical crawl of
+    # these courts, so it must not block a real (full) fetch as "already complete".
+    if any(run.is_complete and not run.listing_truncated for run in matches):
+        done = next(
+            run for run in matches if run.is_complete and not run.listing_truncated
+        )
         console.print(
             f"A complete run for [bold]{', '.join(c.value for c in courts)}[/] "
             f"already exists ([bold]{done.name}[/]). Use `courts-scraper update` to "
@@ -469,6 +475,9 @@ def _fetch_new(
     try:
         with run_lock(config.run_dir), Repository(config.db_path) as repo:
             recorded = run_listing(config, fetcher, repo, preview=preview, console=out)
+            # Record listing completeness only once the listing pass has finished,
+            # so an interrupted crawl never leaves a manifest that claims "complete".
+            finalize_listing(config, preview)
             if not list_only:
                 run_metadata(
                     config, fetcher, repo, cancel=cancel, limit=limit, console=out
@@ -620,6 +629,10 @@ def update_cmd(
                     "partway. Re-run `update` to continue where it left off.[/]"
                 )
                 raise typer.Exit(code=1) from None
+            # Update may only ever clear a prior truncation (coverage is monotonic);
+            # finalize_listing enforces that, so a capped update never mislabels an
+            # already-full run as partial.
+            finalize_listing(config, preview)
             new_rows = repo.counts()["total"] - before
             msg.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
 

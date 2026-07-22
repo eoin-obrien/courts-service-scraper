@@ -9,5 +9,6 @@ prepends each release's notes below and follows
 
 ### Feat
 
+- record listing completeness (`--max-pages` truncation) in the run manifest
 - prompt for courts and confirm scrape scale before running
 - implement courts.ie judgments scraper with resumable downloads

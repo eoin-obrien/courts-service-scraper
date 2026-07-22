@@ -405,8 +405,55 @@ def _copy_versions(run_dirs: list[Path], dest: Path) -> tuple[int, list[str]]:
     return copied, sorted(failed - done)
 
 
+def _source_listings(run_dirs: list[Path]) -> dict[str, object]:
+    """Per-run listing coverage; ``sources`` is the authoritative record.
+
+    A corpus merges many runs, each with its own ``listing`` block, and they can
+    cover different court sets. There is no honest single corpus-level "complete"
+    boolean: a full crawl of Court A plus a truncated crawl of Court B is complete
+    for A and partial for B, so any one flag would lie about one of them. Rather
+    than paper that over, the per-run ``sources`` map is the source of truth, and
+    only two aggregates that are always exactly correct are exposed:
+
+    * ``all_verified`` -- every source carried a verified ``listing`` block (older,
+      pre-feature runs did not, so they read as unverified, never as full).
+    * ``any_truncated`` -- at least one *verified* source was deliberately
+      truncated, so the corpus is known to be missing pages for some court set.
+    """
+    sources: dict[str, object] = {}
+    all_verified = True
+    any_truncated = False
+    for run_dir in run_dirs:
+        block = _read_manifest(run_dir).get("listing")
+        if isinstance(block, dict) and block.get("complete") is True:
+            truncated = bool(block.get("truncated", False))
+            sources[run_dir.name] = {
+                "complete": True,
+                "truncated": truncated,
+                "pages_fetched": block.get("pages_fetched"),
+                "pages_available": block.get("pages_available"),
+            }
+            any_truncated = any_truncated or truncated
+        else:
+            sources[run_dir.name] = {"verified": False}
+            all_verified = False
+    return {
+        "sources": sources,
+        "all_verified": all_verified,
+        "any_truncated": any_truncated,
+        "note": (
+            "Per-source 'sources' is authoritative. Corpus-level completeness "
+            "across differing court sets is not reduced to a single boolean; "
+            "'any_truncated' means at least one verified source was capped."
+        ),
+    }
+
+
 def _snapshot(
-    merge: MergeResult, record_count: int, revisions: _RevisionScan
+    merge: MergeResult,
+    record_count: int,
+    revisions: _RevisionScan,
+    run_dirs: list[Path],
 ) -> dict[str, object]:
     return {
         "created": _now_iso(),
@@ -414,6 +461,7 @@ def _snapshot(
         "schema_version": SCHEMA_VERSION,
         "derive_version": DERIVE_VERSION,
         "source_runs": merge.run_names,
+        "listing": _source_listings(run_dirs),
         "record_count": record_count,
         "conflict_count": len(merge.conflicts),
         "conflicts": [
@@ -599,7 +647,7 @@ def build_corpus(
     if data_dir.exists():
         shutil.rmtree(data_dir)
     revisions = _collect_revisions(runs)
-    snapshot = _snapshot(merge, record_count, revisions)
+    snapshot = _snapshot(merge, record_count, revisions, runs)
 
     # Tabular package (reuses the exact export writers) into the bag payload.
     write_package(
