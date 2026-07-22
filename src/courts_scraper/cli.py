@@ -49,7 +49,7 @@ from courts_scraper.http import Fetcher
 from courts_scraper.models import RunConfig
 from courts_scraper.progress import ProgressReporter, RunFinished, RunStarted
 from courts_scraper.progress.select import select_reporter
-from courts_scraper.query import Court
+from courts_scraper.query import Court, resolve_court_tokens
 from courts_scraper.run import (
     PHASE_DOWNLOADS,
     PHASE_LISTING,
@@ -217,7 +217,10 @@ CourtOption = Annotated[
     typer.Option(
         "--court",
         "-c",
-        help="Court to include (repeatable): supreme, court_of_appeal, high. "
+        help="Court to include (repeatable): supreme, court_of_appeal, high, "
+        "court_of_criminal_appeal, courts_martial_appeal, central_criminal, "
+        "special_criminal, circuit, district. Group aliases: superior (supreme "
+        "+ court_of_appeal + high), all. "
         "If omitted (and no run selector given), you are prompted to choose.",
     ),
 ]
@@ -292,7 +295,7 @@ UserAgentOption = Annotated[
 
 def _resolve_courts(tokens: list[str]) -> tuple[Court, ...]:
     try:
-        return tuple(Court.from_token(t) for t in tokens)
+        return resolve_court_tokens(tokens)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 

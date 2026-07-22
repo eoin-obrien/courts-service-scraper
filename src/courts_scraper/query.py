@@ -9,6 +9,13 @@ encodes its faceted search as an Alfresco query embedded in the URL *path*
 
 (shown decoded). Adding another court is a one-line change: extend the
 :class:`Court` enum. No other module needs to change.
+
+Selecting several courts at once repeats the ``filter:alfresco_Court.<name>``
+token, each joined by ``AND``. The site's Alfresco parser treats repeated
+values of the *same* facet as a union, so this yields the OR of those courts
+(verified live: Supreme + High returns 16,437 results, exactly the two courts).
+An explicit ``(A OR B)`` grouping does **not** work -- the parser drops the
+whole court constraint and returns the entire unfiltered corpus.
 """
 
 from __future__ import annotations
@@ -21,13 +28,20 @@ from urllib.parse import quote
 class Court(StrEnum):
     """Courts selectable via the ``filter:alfresco_Court.<name>`` facet.
 
-    The value is the court name exactly as the site expects it in the filter.
+    The value is the court name exactly as the site expects it in the filter
+    (verified against the live "Jurisdiction" facet on the judgments search).
     The name (left-hand side) is the short token accepted on the command line.
     """
 
     SUPREME = "Supreme Court"
     COURT_OF_APPEAL = "Court of Appeal"
     HIGH = "High Court"
+    COURT_OF_CRIMINAL_APPEAL = "Court of Criminal Appeal"
+    COURTS_MARTIAL_APPEAL = "Courts-Martial Appeal Courts"
+    CENTRAL_CRIMINAL = "Central Criminal Court"
+    SPECIAL_CRIMINAL = "Special Criminal Court"
+    CIRCUIT = "Circuit Court"
+    DISTRICT = "District Court"
 
     @classmethod
     def from_token(cls, token: str) -> Court:
@@ -50,6 +64,41 @@ class Court(StrEnum):
             ) from None
 
 
+# Named groups that expand to several courts, accepted anywhere a court token
+# is. ``superior`` is the constitutional Superior Courts of Ireland; ``all``
+# is every selectable facet.
+COURT_GROUPS: dict[str, tuple[Court, ...]] = {
+    "superior": (Court.SUPREME, Court.COURT_OF_APPEAL, Court.HIGH),
+    "all": tuple(Court),
+}
+
+
+def resolve_court_tokens(tokens: Iterable[str]) -> tuple[Court, ...]:
+    """Resolve CLI tokens -- individual courts or group aliases -- to courts.
+
+    Group aliases (see :data:`COURT_GROUPS`, e.g. ``"superior"``) expand to
+    several courts. Duplicates are removed while preserving first-seen order,
+    so ``--court superior --court high`` is the same three courts, once each.
+
+    Args:
+        tokens: CLI tokens, each a court short name or a group alias.
+
+    Returns:
+        The resolved courts, deduplicated, in first-seen order.
+
+    Raises:
+        ValueError: If a token is neither a known court nor a group alias.
+    """
+    resolved: list[Court] = []
+    for token in tokens:
+        group = COURT_GROUPS.get(token.strip().lower())
+        courts = group if group is not None else (Court.from_token(token),)
+        for court in courts:
+            if court not in resolved:
+                resolved.append(court)
+    return tuple(resolved)
+
+
 def build_query(courts: Iterable[Court], *, doc_type: str = "Judgment") -> str:
     """Build the (decoded) Alfresco query string for the given courts.
 
@@ -66,9 +115,10 @@ def build_query(courts: Iterable[Court], *, doc_type: str = "Judgment") -> str:
         ValueError: If ``courts`` is empty.
 
     Note:
-        The single-court form is verified against the live site. The
-        multi-court ``OR`` grouping is constructed by analogy and should be
-        confirmed against live results before relying on it.
+        Multiple courts each contribute a ``filter:alfresco_Court.<name>``
+        token joined by ``AND``. The site unions repeated values of the same
+        facet, so the result is the OR of the courts. Verified live: Supreme +
+        High returns 16,437 results (the two courts, nothing else).
     """
     court_list = list(courts)
     if not court_list:
@@ -77,12 +127,7 @@ def build_query(courts: Iterable[Court], *, doc_type: str = "Judgment") -> str:
     # Leading space inside the first quote is intentional -- it mirrors the
     # exact token the site emits and must be preserved for a byte-identical URL.
     parts = [f'" type:{doc_type}"', '"filter:alfresco_radio.title"']
-
-    court_filters = [f'"filter:alfresco_Court.{c.value}"' for c in court_list]
-    if len(court_filters) == 1:
-        parts.append(court_filters[0])
-    else:
-        parts.append("(" + " OR ".join(court_filters) + ")")
+    parts.extend(f'"filter:alfresco_Court.{c.value}"' for c in court_list)
 
     return " AND ".join(parts)
 
