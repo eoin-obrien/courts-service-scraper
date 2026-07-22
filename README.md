@@ -81,6 +81,9 @@ uv run courts-scraper export --latest --format csv,json,parquet
 
 # Merge every run into one citable, fixity-checked corpus bundle (BagIt)
 uv run courts-scraper corpus --out data/corpus
+# ...or choose which runs go in: an interactive checklist, or explicit folders
+uv run courts-scraper corpus --select
+uv run courts-scraper corpus --run-dir data/<run-a> --run-dir data/<run-b>
 
 # Print the column data dictionary (generated from the schema)
 uv run courts-scraper dictionary
