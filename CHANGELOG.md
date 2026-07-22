@@ -9,6 +9,11 @@ prepends each release's notes below and follows
 
 ### Feat
 
+- add `corpus --archive <zip|tar|tar.gz|tar.bz2|tar.xz>`, which serialises the
+  finished bag into a single shareable file (the archive's one top-level entry is
+  the bag directory, per the BagIt serialisation convention, so it validates
+  directly) and writes a `sha256sum`-compatible `.sha256` sidecar for verifying
+  the transfer
 - let `corpus` choose which runs to include: `--select` opens an interactive
   checklist (all pre-checked), or pass repeatable `--run-dir` folders; the default
   is still every readable run

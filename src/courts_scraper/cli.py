@@ -37,7 +37,12 @@ from rich.console import Console
 from rich.table import Table
 
 from courts_scraper import __version__, prompts
-from courts_scraper.corpus import build_corpus
+from courts_scraper.corpus import (
+    ARCHIVE_FORMAT_CHOICES,
+    build_corpus,
+    resolve_archive_format,
+    serialize_bag,
+)
 from courts_scraper.db import Repository
 from courts_scraper.export import ExportError, data_dictionary_markdown, export_run
 from courts_scraper.http import Fetcher
@@ -1047,12 +1052,22 @@ def corpus_cmd(
         str,
         typer.Option("--format", "-f", help="Comma-separated: csv, json, parquet."),
     ] = "csv,json",
+    archive: Annotated[
+        str | None,
+        typer.Option(
+            "--archive",
+            help="Also bundle the bag as one shareable file: "
+            + ", ".join(ARCHIVE_FORMAT_CHOICES)
+            + ". Writes <corpus>.<ext> plus a .sha256 sidecar for transfer checks.",
+        ),
+    ] = None,
     json_out: JsonOption = False,
 ) -> None:
     """Merge runs into one citable BagIt corpus (dedup + fixity + datasheet).
 
     Includes every readable run by default; narrow it with repeatable ``--run-dir``
-    folders, or ``--select`` to pick from an interactive checklist.
+    folders, or ``--select`` to pick from an interactive checklist. ``--archive``
+    additionally serialises the finished bag into a single file for sharing.
     """
     data_dir = _state(ctx).data_dir
     readable = [run for run in list_runs(data_dir) if run.readable]
@@ -1063,10 +1078,21 @@ def corpus_cmd(
     formats = [token.strip() for token in fmt.split(",") if token.strip()]
     if not formats:
         raise typer.BadParameter("--format must name at least one format.")
+    # Validate the archive format up front so a typo does not waste a long build.
+    if archive is not None:
+        try:
+            resolve_archive_format(archive)
+        except ExportError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     try:
         result = build_corpus(run_dirs, out_dir, formats=formats)
     except (ExportError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+    archive_path: Path | None = None
+    archive_sha: str | None = None
+    if archive is not None:
+        archive_path, archive_sha = serialize_bag(out_dir, archive)
 
     if json_out:
         print(
@@ -1078,6 +1104,8 @@ def corpus_cmd(
                     "conflicts": len(result.conflicts),
                     "missing_pdfs": len(result.missing_pdfs),
                     "unverified_versions": len(result.unverified_versions),
+                    "archive": str(archive_path) if archive_path else None,
+                    "archive_sha256": archive_sha,
                 }
             )
         )
@@ -1087,6 +1115,11 @@ def corpus_cmd(
         f"Corpus: [bold]{result.record_count}[/] records from "
         f"{len(run_dirs)} run(s) -> [bold]{out_dir}[/]."
     )
+    if archive_path is not None and archive_sha is not None:
+        console.print(
+            f"Archive: [bold]{archive_path}[/] "
+            f"(sha256 {archive_sha[:12]}..., sidecar {archive_path.name}.sha256)."
+        )
     if result.conflicts:
         console.print(
             f"[yellow]{len(result.conflicts)} content conflict(s)[/] "
