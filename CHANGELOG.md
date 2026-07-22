@@ -7,8 +7,22 @@ prepends each release's notes below and follows
 
 ## Unreleased
 
+### Fix
+
+- select multiple courts in one run correctly. The multi-court query wrapped the
+  per-court filters in an explicit `(A OR B)` group, which the courts.ie search
+  parser does not understand: it dropped the whole court constraint and returned
+  the entire unfiltered corpus (21,141 rows, including courts you never picked).
+  Repeat the `filter:alfresco_Court.<name>` token joined by `AND` instead, which
+  the site unions -- verified live (Supreme + High = 16,437, exactly those two)
+
 ### Feat
 
+- add the six remaining courts the site exposes (`court_of_criminal_appeal`,
+  `courts_martial_appeal`, `central_criminal`, `special_criminal`, `circuit`,
+  `district`) alongside the existing three, plus group aliases `superior`
+  (Supreme + Court of Appeal + High) and `all`, so `fetch --court superior`
+  crawls every superior court in a single run
 - add `corpus --archive <zip|tar|tar.gz|tar.bz2|tar.xz>`, which serialises the
   finished bag into a single shareable file (the archive's one top-level entry is
   the bag directory, per the BagIt serialisation convention, so it validates

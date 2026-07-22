@@ -134,7 +134,14 @@ is unchanged -- still exactly one JSON document on stdout.
 Scraping is deliberately not eager:
 
 - **No `--court`?** You get a checkbox multiselect to pick courts (Supreme Court
-  pre-selected). Pass `--court` one or more times to skip the prompt.
+  pre-selected). Pass `--court` one or more times to skip the prompt. Selecting
+  several courts fetches the union of their judgments in a single run.
+- **Which courts?** `supreme`, `court_of_appeal`, `high`,
+  `court_of_criminal_appeal`, `courts_martial_appeal`, `central_criminal`,
+  `special_criminal`, `circuit`, `district`. Two group aliases expand to
+  several courts: `superior` (Supreme + Court of Appeal + High) and `all`.
+  For example, crawl every superior court at once with
+  `--court superior`.
 - **Before any crawl** the tool shows the scale (result count, page count,
   estimated time at the current politeness settings) and asks you to confirm.
 
