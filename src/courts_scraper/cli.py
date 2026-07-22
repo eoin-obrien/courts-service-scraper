@@ -80,6 +80,9 @@ app = typer.Typer(
         "  courts-scraper status --latest      # check progress\n"
         "  courts-scraper update --latest      # later: pull new judgments\n"
         "  courts-scraper export --latest      # publish a data package\n\n"
+        "A wide terminal shows a live dashboard (ETA, current item, next-request\n"
+        "countdown, outage state); piped/cron/narrow/--quiet runs fall back to plain\n"
+        "status lines (or silence).\n\n"
         "Exit codes: 0 success (incl. clean first-Ctrl-C stop) | 1 outage/error | "
         "2 bad usage | 130 second Ctrl-C | 143 SIGTERM."
     ),

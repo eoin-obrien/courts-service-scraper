@@ -109,6 +109,19 @@ that is already complete and points you at `update`.
 Exit codes: `0` success (including a clean first-Ctrl-C stop), `1` outage/error,
 `2` bad usage, `130` a second Ctrl-C, `143` SIGTERM.
 
+### Watching a crawl
+
+A crawl of thousands of judgments is polite, so it is mostly *waiting* on purpose.
+In a wide interactive terminal `fetch`/`update` show a live dashboard that makes that
+legible: overall progress, an **ETA and finish time**, the current judgment, a
+**countdown to the next request** (so a paused-for-politeness crawl never looks hung),
+and a loud banner when the site is down and the crawler is backing off. When output is
+piped, run under cron, on a terminal narrower than 80 columns, or with `--quiet`, it
+falls back to plain periodic status lines (never an animated bar smeared into a log),
+so the same progress is readable in a log file. `NO_COLOR` is honoured and the glyphs
+degrade to ASCII on non-UTF-8 terminals. The `--json` output of `status`/`update`/etc.
+is unchanged -- still exactly one JSON document on stdout.
+
 ### Choosing courts and confirming
 
 Scraping is deliberately not eager:
