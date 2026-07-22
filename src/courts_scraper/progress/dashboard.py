@@ -1,19 +1,20 @@
-"""The live terminal dashboard: a ``rich.Live`` sink over a :class:`ProgressModel`.
+"""The live terminal dashboard: bottom-pinned ``rich.Progress`` bars + a scroll log.
 
-The engine thread feeds events through :meth:`LiveDashboardReporter.emit`; a
-separate ``rich.Live`` refresh thread redraws at a fixed rate from an immutable
-:meth:`ProgressModel.snapshot`, so the countdown animates even while the engine is
-blocked in a politeness ``sleep()`` (proven by the P0 spike). Rendering is a pure
-function of a snapshot -- :func:`render_dashboard` -- so every display state can be
-unit-tested without a terminal or a real crawl.
+The engine thread feeds events through :meth:`LiveDashboardReporter.emit`. Two
+``rich.Progress`` tasks (an overall bar and the current-phase bar) stay pinned at
+the bottom of the terminal, and *notable* events (phase headers, skips, errors,
+outages, milestones) scroll **above** them via ``progress.console.print`` -- the
+docker/cargo shape. A clean run scrolls calmly; the current judgment rides in the
+phase bar's description rather than spamming a line per item.
 
-Two robustness details the spike and review surfaced:
-
-* the countdown is clamped near zero to the transitional "requesting" state, so the
-  unavoidable ``sleep()``->``RequestStarted`` boundary race can never render a
-  frozen ``0.0s``; and
-* glyphs fall back to ASCII when the output encoding is not UTF-8, and colour is
-  dropped when ``NO_COLOR`` is set.
+The "breathing" countdown to the next polite request survives as a custom
+``rich.Progress`` column: Progress re-invokes every column on each refresh tick, so
+a column that reads the shared :class:`ProgressModel` snapshot animates *while the
+engine thread is blocked in a politeness* ``sleep()`` (proven by the P0 spike). The
+countdown is clamped near zero to the transitional "requesting" state, so the
+unavoidable ``sleep()``->``RequestStarted`` boundary race never renders a frozen
+``0.0s``. Colour is dropped when ``NO_COLOR`` is set (via the Console), and the
+spinner falls back to an ASCII animation when the output encoding is not UTF-8.
 """
 
 from __future__ import annotations
@@ -24,36 +25,62 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
 
-from rich.console import Console, Group, RenderableType
-from rich.live import Live
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    Task,
+    TaskID,
+    TextColumn,
+)
+from rich.table import Column
 from rich.text import Text
 
-from courts_scraper.progress.events import Event
+from courts_scraper.progress.events import (
+    Cancelled,
+    Event,
+    ItemFinished,
+    ItemStarted,
+    ItemStatus,
+    OutageGaveUp,
+    OutagePaused,
+    OutageProbing,
+    OutageRecovered,
+    PhaseStarted,
+    RunFinished,
+    RunStarted,
+)
 from courts_scraper.progress.format import format_clock, format_duration
 from courts_scraper.progress.model import ProgressModel, Snapshot
 
-_OVERALL_BAR_WIDTH = 28
-_PHASE_BAR_WIDTH = 20
+#: Print a milestone line every this many successfully-finished items.
+_MILESTONE = 500
+#: Fixed width for the description column, so a long citation on the phase row
+#: cannot widen the shared column and wrap the (short) overall row past 80 cols.
+#: rich ellipsizes any overflow inside this width.
+_DESC_MAX = 32
+#: Short labels for the countdown, keeping the phase row narrow enough to fit 80c.
+_WAIT_LABEL = {"politeness": "next", "retry_backoff": "retry", "outage_probe": "probe"}
 
 
 @dataclass(frozen=True, slots=True)
 class Glyphs:
-    """A set of drawing glyphs, with a UTF-8 and an ASCII variant."""
+    """A small set of status glyphs, with a UTF-8 and an ASCII variant."""
 
-    fill: str
-    empty: str
-    left: str
-    right: str
     dot: str
     down: str
     check: str
     warn: str
     retry: str
     pause: str
+    cross: str
 
 
-UNICODE = Glyphs("█", "░", "▕", "▏", "●", "↓", "✓", "⚠", "↺", "⏸")
-ASCII = Glyphs("#", "-", "[", "]", "*", ">", "v", "!", "~", "||")
+UNICODE = Glyphs("·", "↓", "✓", "⚠", "↺", "⏸", "✗")
+ASCII = Glyphs(".", ">", "v", "!", "~", "||", "x")
 
 
 def glyphs_for(encoding: str | None) -> Glyphs:
@@ -61,14 +88,14 @@ def glyphs_for(encoding: str | None) -> Glyphs:
     return UNICODE if encoding and "utf" in encoding.lower() else ASCII
 
 
-def _bar(fraction: float, width: int, g: Glyphs) -> str:
-    fraction = min(1.0, max(0.0, fraction))
-    filled = round(fraction * width)
-    return f"{g.left}{g.fill * filled}{g.empty * (width - filled)}{g.right}"
-
-
 def _countdown_text(snap: Snapshot, now: float, clamp: float, g: Glyphs) -> str:
-    """The "Now / Next request" line, honouring the near-zero clamp (H2)."""
+    """The phase bar's trailing countdown, honouring the near-zero clamp (H2).
+
+    Kept pure so its timing behaviour is unit-testable. During an outage it shows
+    the probe state instead of a request countdown.
+    """
+    if snap.outage_state in ("paused", "probing"):
+        return f"{g.pause} probing {int(snap.outage_probe_in)}s"
     if snap.requesting:
         return f"{g.dot} request in flight"
     if snap.wait_until_monotonic is not None:
@@ -76,100 +103,108 @@ def _countdown_text(snap: Snapshot, now: float, clamp: float, g: Glyphs) -> str:
         if remaining <= clamp:
             # Within a frame of zero the request is imminent; never show 0.0s.
             return f"{g.dot} requesting..."
-        reason = (snap.wait_reason.value if snap.wait_reason else "wait").replace(
-            "_", " "
-        )
-        return f"next {reason} request in {remaining:4.1f}s"
+        reason = snap.wait_reason.value if snap.wait_reason else "politeness"
+        return f"{_WAIT_LABEL.get(reason, 'next')} in {remaining:4.1f}s"
     return ""
 
 
-def render_dashboard(
-    snap: Snapshot, *, glyphs: Glyphs, now: float, clamp: float
-) -> RenderableType:
-    """Build the dashboard renderable for one snapshot (pure, testable)."""
-    g = glyphs
-    lines: list[RenderableType] = []
-
-    title = f"courts-scraper {'/'.join(snap.courts) or 'run'} - {snap.run_name}".strip()
-    lines.append(Text(title, style="bold"))
-
-    # ETA is the primary datum for a multi-hour run: give it the top line.
+def _eta_text(snap: Snapshot) -> str:
+    """The overall bar's trailing ETA + finish-time, from a snapshot."""
     if snap.finished:
-        state = "incomplete - resume to finish" if snap.incomplete else "complete"
-        lines.append(Text(f"Run {state}", style="bold green"))
-    elif snap.eta_seconds is not None:
-        done_at = (
-            f" - done ~{format_clock(snap.done_at_wall)}"
-            if snap.done_at_wall is not None
-            else ""
-        )
-        lines.append(
-            Text(f"ETA {format_duration(snap.eta_seconds)}{done_at}", style="bold")
-        )
-    else:
-        lines.append(Text("ETA - (estimating)", style="bold"))
-
-    # Overall request progress.
-    if snap.est_total_requests > 0:
-        frac = snap.requests_done / snap.est_total_requests
-        lines.append(
-            Text(
-                f"Overall {_bar(frac, _OVERALL_BAR_WIDTH, g)} {frac * 100:4.1f}% "
-                f"- {snap.requests_done:,}/{snap.est_total_requests:,} req"
-            )
-        )
-
-    # Phase progress; the listing phase can have an unknown item total.
-    if snap.phase_name:
-        if snap.phase_items > 0:
-            pfrac = snap.phase_done / snap.phase_items
-            bar = _bar(pfrac, _PHASE_BAR_WIDTH, g)
-            phase_bar = f"{bar} {snap.phase_done}/{snap.phase_items}"
-        else:
-            phase_bar = f"{snap.phase_done} done"
-        pos = f"{snap.phase_index}/{snap.phase_total}" if snap.phase_total else ""
-        lines.append(Text(f"Phase {pos} {snap.phase_name}  {phase_bar}"))
-
-    # Outage banner replaces the live "Now/Next" rows while paused.
-    if snap.outage_state in ("paused", "probing"):
-        lines.append(
-            Text(
-                f"{g.pause} PAUSED - site appears down; probing in "
-                f"{int(snap.outage_probe_in)}s "
-                f"(down {format_duration(snap.outage_down_seconds)})",
-                style="yellow",
-            )
-        )
-    elif snap.outage_state == "gave_up":
-        lines.append(
-            Text(
-                f"{g.pause} site still down after the cap; stopping (resume later)",
-                style="red",
-            )
-        )
-    elif snap.cancelled:
-        lines.append(Text("stopping cleanly (cancelled)...", style="yellow"))
-    elif not snap.finished:
-        if snap.current_label:
-            lines.append(Text(f"Now  {g.down} {snap.current_label}"))
-        countdown = _countdown_text(snap, now, clamp, g)
-        rate = f"  rate {snap.rate_per_min:.1f}/min" if snap.rate_per_min else ""
-        if countdown or rate:
-            lines.append(Text(f"{countdown}{rate}"))
-
-    # Health tally.
-    lines.append(
-        Text(
-            f"{g.check} {snap.ok:,} done   {g.warn} {snap.skipped:,} skipped   "
-            f"{snap.error:,} error   {g.retry} {snap.retry:,} retry",
-            style="dim",
-        )
+        return "complete" if not snap.incomplete else "incomplete"
+    if snap.eta_seconds is None:
+        return "ETA -"
+    done = (
+        f" ~{format_clock(snap.done_at_wall)}" if snap.done_at_wall is not None else ""
     )
-    return Group(*lines)
+    return f"ETA {format_duration(snap.eta_seconds)}{done}"
+
+
+def scroll_line_for(event: Event, g: Glyphs) -> str | None:
+    """The curated scroll line for ``event``, or ``None`` to print nothing.
+
+    Pure function of the event (so the "what scrolls" policy is unit-testable
+    without a terminal). A clean run only surfaces phase headers, the run title,
+    and the final summary; the noisy per-request events (``ok`` finishes, request
+    starts, waits) return ``None`` and are reflected only in the bars. The
+    milestone heartbeat is emitted by the reporter (it depends on a running count,
+    not one event).
+    """
+    if isinstance(event, RunStarted):
+        courts = "/".join(event.courts) or "run"
+        return f"{courts}  {event.run_name}"
+    if isinstance(event, PhaseStarted):
+        size = f"{event.items:,}" if event.items else "?"
+        return f"-- {event.phase} {size} --"
+    if isinstance(event, ItemFinished):
+        if event.status is ItemStatus.SKIPPED_NO_CITATION:
+            return f"{g.warn} skipped: {event.detail}"
+        if event.status is ItemStatus.ERROR:
+            return f"{g.cross} error: {event.detail}"
+        if event.status is ItemStatus.DEFERRED:
+            return f"{g.retry} deferred: {event.detail} (will retry)"
+        return None  # ok -> the bars carry it
+    if isinstance(event, OutagePaused):
+        return f"{g.pause} site appears down; pausing until it recovers"
+    if isinstance(event, OutageProbing):
+        return (
+            f"  probing again in {int(event.probe_in_seconds)}s "
+            f"(down {format_duration(event.down_seconds)})"
+        )
+    if isinstance(event, OutageRecovered):
+        return (
+            f"{g.check} site back after {format_duration(event.down_seconds)}; resuming"
+        )
+    if isinstance(event, OutageGaveUp):
+        return f"{g.cross} site still down after the cap; stopping (resume later)"
+    if isinstance(event, Cancelled):
+        return f"stopping cleanly (cancelled during {event.phase})..."
+    if isinstance(event, RunFinished):
+        state = "incomplete" if event.incomplete else "complete"
+        return (
+            f"run {state} in {format_duration(event.elapsed_seconds)} "
+            f"({event.counts.get('download_done', 0)} downloaded, "
+            f"{event.counts.get('download_error', 0)} to retry)"
+        )
+    return None
+
+
+class _TrailerColumn(ProgressColumn):
+    """One column shared by both bars; branches on the task's ``kind`` field.
+
+    Reads the shared :class:`ProgressModel` snapshot directly (Progress only hands
+    a column the task), so it animates on every refresh tick: ETA for the overall
+    task, the live countdown for the phase task.
+    """
+
+    def __init__(
+        self,
+        model: ProgressModel,
+        *,
+        clamp: float,
+        glyphs: Glyphs,
+        monotonic: Callable[[], float],
+    ) -> None:
+        """Wire the column to the model and the clock."""
+        super().__init__()
+        self._model = model
+        self._clamp = clamp
+        self._glyphs = glyphs
+        self._monotonic = monotonic
+
+    def render(self, task: Task) -> Text:
+        """Render the trailing text for ``task`` from the current snapshot."""
+        snap = self._model.snapshot()
+        if task.fields.get("kind") == "overall":
+            return Text(_eta_text(snap), style="bold")
+        return Text(
+            _countdown_text(snap, self._monotonic(), self._clamp, self._glyphs),
+            style="cyan",
+        )
 
 
 class LiveDashboardReporter:
-    """A ``rich.Live`` dashboard fed by progress events."""
+    """A bottom-pinned ``rich.Progress`` dashboard fed by progress events."""
 
     def __init__(
         self,
@@ -186,44 +221,94 @@ class LiveDashboardReporter:
             console: The (terminal) console to draw on.
             delay: Politeness delay, for the model's ETA.
             jitter: Politeness jitter.
-            refresh_hz: Live refresh rate; also sets the countdown clamp.
+            refresh_hz: Progress refresh rate; also sets the countdown clamp.
             monotonic: Monotonic clock (injectable for tests).
         """
         self._console = console
         self._model = ProgressModel(delay=delay, jitter=jitter, monotonic=monotonic)
-        self._monotonic = monotonic
-        self._refresh_hz = refresh_hz
-        self._clamp = 1.0 / refresh_hz + 0.05
         self._glyphs = glyphs_for(console.encoding)
-        # get_renderable (not a static frame) so Live's refresh thread recomputes
-        # the snapshot and the clock every tick -- this is what animates the
-        # countdown *while the engine thread is blocked in a politeness sleep()*,
-        # when no events are being emitted (the P0 spike's mechanism).
-        self._live = Live(
-            get_renderable=self._renderable,
+        self._milestone = 0
+        # An ASCII spinner when the terminal can't render the default braille one.
+        spinner = "dots" if self._glyphs is UNICODE else "line"
+        self._progress = Progress(
+            SpinnerColumn(spinner_name=spinner),
+            # Fixed-width, non-wrapping description so a long citation on the phase
+            # row cannot widen the shared column and wrap the (short) overall row;
+            # the flexible bar absorbs the slack. rich ellipsizes any overflow.
+            TextColumn(
+                "[bold]{task.description}",
+                table_column=Column(width=_DESC_MAX, no_wrap=True, overflow="ellipsis"),
+            ),
+            BarColumn(),
+            MofNCompleteColumn(),
+            _TrailerColumn(
+                self._model,
+                clamp=1.0 / refresh_hz + 0.05,
+                glyphs=self._glyphs,
+                monotonic=monotonic,
+            ),
             console=console,
             refresh_per_second=refresh_hz,
             transient=False,
         )
-
-    def _renderable(self) -> RenderableType:
-        return render_dashboard(
-            self._model.snapshot(),
-            glyphs=self._glyphs,
-            now=self._monotonic(),
-            clamp=self._clamp,
-        )
+        self._overall: TaskID | None = None
+        self._phase: TaskID | None = None
 
     def emit(self, event: Event) -> None:
-        """Fold ``event`` into the model and force an immediate redraw."""
+        """Fold ``event`` into the model, update the bars, and scroll a line."""
         self._model.apply(event)
-        # Redraw now so a state change shows instantly rather than at the next tick;
-        # get_renderable pulls the fresh snapshot.
-        self._live.refresh()
+
+        if isinstance(event, RunStarted):
+            snap = self._model.snapshot()
+            self._overall = self._progress.add_task(
+                "overall", total=snap.est_total_requests or None, kind="overall"
+            )
+        elif isinstance(event, PhaseStarted):
+            total = event.items or None
+            if self._phase is None:
+                self._phase = self._progress.add_task(
+                    event.phase, total=total, kind="phase"
+                )
+            else:
+                self._progress.reset(self._phase, total=total, description=event.phase)
+        elif isinstance(event, ItemStarted) and self._phase is not None:
+            self._progress.update(
+                self._phase, description=f"{self._glyphs.down} {event.label}"
+            )
+
+        self._sync_bars()
+
+        line = scroll_line_for(event, self._glyphs)
+        if line is not None:
+            self._progress.console.print(line)
+        self._maybe_milestone(event)
+
+    def _sync_bars(self) -> None:
+        snap = self._model.snapshot()
+        if self._overall is not None:
+            self._progress.update(
+                self._overall,
+                completed=snap.requests_done,
+                total=snap.est_total_requests or None,
+            )
+        if self._phase is not None:
+            self._progress.update(
+                self._phase,
+                completed=snap.phase_done,
+                total=snap.phase_items or None,
+            )
+
+    def _maybe_milestone(self, event: Event) -> None:
+        if not (isinstance(event, ItemFinished) and event.status is ItemStatus.OK):
+            return
+        ok = self._model.snapshot().ok
+        if ok and ok - self._milestone >= _MILESTONE:
+            self._milestone = ok - (ok % _MILESTONE)
+            self._progress.console.print(f"{self._glyphs.dot} {ok:,} done")
 
     def __enter__(self) -> LiveDashboardReporter:
-        """Start the live display."""
-        self._live.__enter__()
+        """Start the pinned progress display."""
+        self._progress.__enter__()
         return self
 
     def __exit__(
@@ -232,13 +317,8 @@ class LiveDashboardReporter:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Render a final frame and restore the terminal, even on interrupt."""
-        # A final refresh so the completed/cancelled frame is the last thing left
-        # on screen, then hand off to Live to restore the cursor.
-        try:
-            self._live.refresh()
-        finally:
-            self._live.__exit__(exc_type, exc, tb)
+        """Stop the progress display, restoring the terminal (even on interrupt)."""
+        self._progress.__exit__(exc_type, exc, tb)
 
 
 def env_no_color() -> bool:
