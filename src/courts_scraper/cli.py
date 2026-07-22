@@ -234,6 +234,15 @@ ListOnlyOption = Annotated[
         help="Record the search results only (no metadata/PDFs). New runs only.",
     ),
 ]
+RetrySkippedOption = Annotated[
+    bool,
+    typer.Option(
+        "--retry-skipped",
+        help="Before fetching metadata, re-queue rows skipped by an earlier pass "
+        "(e.g. no Neutral Citation yet). The site backfills these over time, so a "
+        "later run can resolve them. Applies to a resume or update, not a new run.",
+    ),
+]
 DelayOption = Annotated[
     float, typer.Option("--delay", help="Minimum seconds between requests.")
 ]
@@ -365,6 +374,7 @@ def fetch_cmd(
     run_dir: RunDirOption = None,
     latest: LatestOption = False,
     list_only: ListOnlyOption = False,
+    retry_skipped: RetrySkippedOption = False,
     delay: DelayOption = 5.0,
     jitter: JitterOption = 2.0,
     max_pages: MaxPagesOption = None,
@@ -381,6 +391,12 @@ def fetch_cmd(
     if court and resume_selector:
         raise typer.BadParameter(
             "--court starts a new run; it cannot be combined with --run-dir/--latest."
+        )
+    if court and retry_skipped:
+        raise typer.BadParameter(
+            "--retry-skipped re-queues rows an earlier pass skipped; a new run "
+            "(--court) has none. Use it when resuming (--run-dir/--latest) or on "
+            "`update`."
         )
     if list_only and resume_selector:
         raise typer.BadParameter(
@@ -407,7 +423,9 @@ def fetch_cmd(
         return
     if resume_selector:
         resolved = _resolve_run_dir(run_dir, state.data_dir, latest)
-        _fetch_resume(state, resolved, net, limit=limit, yes=yes)
+        _fetch_resume(
+            state, resolved, net, limit=limit, yes=yes, retry_skipped=retry_skipped
+        )
         return
 
     # No selector: interactive front door, or a clear error in a non-TTY.
@@ -438,7 +456,9 @@ def fetch_cmd(
             offer_resume=False,
         )
     else:
-        _fetch_resume(state, chosen.path, net, limit=limit, yes=yes)
+        _fetch_resume(
+            state, chosen.path, net, limit=limit, yes=yes, retry_skipped=retry_skipped
+        )
 
 
 @dataclass(frozen=True)
@@ -569,10 +589,18 @@ def _fetch_resume(
     *,
     limit: int | None,
     yes: bool,
+    retry_skipped: bool = False,
 ) -> None:
     """Resume a run: scrape metadata and download PDFs (resumable, cancellable)."""
     config = _load(run_dir, net)
     with Repository(config.db_path) as repo:
+        # Re-queue earlier skips first, so a run that is otherwise "complete"
+        # except for missing-citation rows is picked up again.
+        if retry_skipped:
+            requeued = repo.reset_meta_errors()
+            console.print(
+                f"Re-queued [bold]{requeued}[/] previously-skipped judgment(s)."
+            )
         counts = repo.counts()
         complete, lines = _resume_summary(counts)
         console.print(f"Resuming [bold]{config.run_dir.name}[/].")
@@ -644,6 +672,7 @@ def update_cmd(
             "this is a full re-fetch of the corpus. Opt-in.",
         ),
     ] = False,
+    retry_skipped: RetrySkippedOption = False,
     max_pages: MaxPagesOption = None,
     delay: DelayOption = 5.0,
     jitter: JitterOption = 2.0,
@@ -693,6 +722,7 @@ def update_cmd(
     reporter = _build_reporter(state, config, json_out=json_out)
     new_rows = 0
     revisions = 0
+    requeued = 0
     try:
         with reporter, run_lock(config.run_dir), Repository(config.db_path) as repo:
             fetcher.set_reporter(reporter)
@@ -719,6 +749,10 @@ def update_cmd(
             # already-full run as partial.
             finalize_listing(config, preview)
             new_rows = repo.counts()["total"] - before
+            # Re-queue earlier skips (silently; reported after the live display
+            # closes) so a scheduled `update --retry-skipped` re-attempts rows the
+            # site has since backfilled.
+            requeued = repo.reset_meta_errors() if retry_skipped else 0
 
             run_metadata(
                 config, fetcher, repo, cancel=cancel, limit=limit, reporter=reporter
@@ -746,6 +780,8 @@ def update_cmd(
 
     # Reported after the live display has closed so it never interleaves a frame.
     msg.print(f"Re-list found [bold]{new_rows}[/] new judgment(s).")
+    if retry_skipped:
+        msg.print(f"Re-queued [bold]{requeued}[/] previously-skipped judgment(s).")
 
     with Repository(config.db_path) as repo:
         errors = repo.counts()["download_error"]
@@ -754,6 +790,7 @@ def update_cmd(
             json.dumps(
                 {
                     "new": new_rows,
+                    "requeued": requeued,
                     "revisions": revisions,
                     "errors": errors,
                     "run": config.run_dir.name,

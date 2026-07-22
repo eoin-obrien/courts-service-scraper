@@ -96,7 +96,9 @@ Useful options: `--delay` / `--jitter` (politeness spacing, defaults 5s + 2s),
 request User-Agent), `--yes` (skip confirmation), `--latest` (act on the newest
 run unattended), `--json` (machine-readable output on `status`/`runs`/`export`/
 `corpus`/`update`), `--revalidate` (on `update`, also re-fetch downloaded PDFs to
-detect and version server-side changes).
+detect and version server-side changes), `--retry-skipped` (on a `fetch` resume or
+`update`, re-queue rows an earlier pass skipped -- e.g. a judgment published without
+a Neutral Citation yet -- so a later run resolves them once the site backfills).
 
 `fetch` vs `update`: `fetch` **starts or finishes** a crawl -- it creates a new run
 (with `--court`) or resumes an incomplete one (with `--run-dir`/`--latest`),

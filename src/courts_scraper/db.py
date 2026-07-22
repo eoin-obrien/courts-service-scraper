@@ -364,6 +364,25 @@ class Repository:
         )
         self._conn.commit()
 
+    def reset_meta_errors(self) -> int:
+        """Re-queue every errored metadata row for another attempt.
+
+        Flips ``meta_status`` from ``error`` back to ``pending`` (clearing the
+        stored ``error_reason``) so the next metadata phase re-scrapes those view
+        pages. This exists because the site intermittently backfills a Neutral
+        Citation that was missing on an earlier crawl -- a row skipped for "no
+        citation" (or a transient parse failure) can resolve on a later pass.
+        The stored ``meta_json`` is left in place; a successful re-scrape
+        overwrites it. Returns the number of rows re-queued.
+        """
+        cur = self._conn.execute(
+            "UPDATE record SET meta_status = ?, error_reason = NULL "
+            "WHERE meta_status = ?",
+            (META_PENDING, META_ERROR),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     # -- phase 2: download ------------------------------------------------
     def record_download(
         self,
