@@ -174,6 +174,31 @@ def test_live_dashboard_reporter_enter_emit_exit():
     assert console.file.getvalue() != ""  # type: ignore[attr-defined]
 
 
+class _MutClock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_live_renderable_recomputes_each_call_so_countdown_animates():
+    # The refresh thread calls get_renderable (== _renderable) every tick with NO
+    # new event; it must reflect the current clock, or the countdown freezes.
+    clock = _MutClock()
+    console = Console(file=io.StringIO(), force_terminal=True, width=80)
+    reporter = LiveDashboardReporter(console, delay=5.0, jitter=0.0, monotonic=clock)
+    reporter._model.apply(ItemStarted("downloads", "x", "u"))
+    reporter._model.apply(WaitStarted(WaitReason.POLITENESS, 5.0, 1005.0))
+    clock.t = 1002.0
+    first = _text(reporter._renderable())
+    clock.t = 1004.0
+    second = _text(reporter._renderable())
+    assert "3.0s" in first
+    assert "1.0s" in second
+    assert first != second
+
+
 # -- plain sink ------------------------------------------------------------
 def test_plain_writes_phase_and_final_lines():
     buf = io.StringIO()
@@ -188,6 +213,18 @@ def test_plain_writes_phase_and_final_lines():
     assert "downloads" in out
     assert "run complete" in out
     assert "\x1b[" not in out  # no cursor-control escapes -- safe in a log
+
+
+def test_plain_final_line_falls_back_to_model_elapsed():
+    clock = _MutClock()
+    buf = io.StringIO()
+    reporter = PlainReporter(buf, delay=0.0, jitter=0.0, monotonic=clock)
+    reporter.emit(RunStarted("r", (), ("downloads",), 1))  # model starts at t=1000
+    clock.t = 1090.0  # 90s later
+    reporter.emit(
+        RunFinished({"download_done": 1, "download_error": 0}, 0.0, incomplete=False)
+    )
+    assert "1m 30s" in buf.getvalue()  # not "in 0s"
 
 
 def test_plain_truncates_long_lines():

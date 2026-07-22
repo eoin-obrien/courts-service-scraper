@@ -107,8 +107,12 @@ class PlainReporter:
 
     def _final_line(self, event: RunFinished) -> str:
         state = "incomplete" if event.incomplete else "complete"
+        # Prefer the event's elapsed, but fall back to the model's tracked elapsed
+        # when the caller did not compute one (it passes 0.0), so a cron/CI log
+        # still reports a real run duration.
+        elapsed = event.elapsed_seconds or self._model.snapshot().elapsed_seconds
         return (
-            f"run {state} in {format_duration(event.elapsed_seconds)} "
+            f"run {state} in {format_duration(elapsed)} "
             f"({event.counts.get('download_done', 0)} downloaded, "
             f"{event.counts.get('download_error', 0)} to retry)"
         )

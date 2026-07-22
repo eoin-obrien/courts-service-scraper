@@ -195,8 +195,12 @@ class LiveDashboardReporter:
         self._refresh_hz = refresh_hz
         self._clamp = 1.0 / refresh_hz + 0.05
         self._glyphs = glyphs_for(console.encoding)
+        # get_renderable (not a static frame) so Live's refresh thread recomputes
+        # the snapshot and the clock every tick -- this is what animates the
+        # countdown *while the engine thread is blocked in a politeness sleep()*,
+        # when no events are being emitted (the P0 spike's mechanism).
         self._live = Live(
-            self._renderable(),
+            get_renderable=self._renderable,
             console=console,
             refresh_per_second=refresh_hz,
             transient=False,
@@ -211,9 +215,11 @@ class LiveDashboardReporter:
         )
 
     def emit(self, event: Event) -> None:
-        """Fold ``event`` into the model and refresh the display."""
+        """Fold ``event`` into the model and force an immediate redraw."""
         self._model.apply(event)
-        self._live.update(self._renderable())
+        # Redraw now so a state change shows instantly rather than at the next tick;
+        # get_renderable pulls the fresh snapshot.
+        self._live.refresh()
 
     def __enter__(self) -> LiveDashboardReporter:
         """Start the live display."""
@@ -227,10 +233,10 @@ class LiveDashboardReporter:
         tb: TracebackType | None,
     ) -> None:
         """Render a final frame and restore the terminal, even on interrupt."""
-        # A final synchronous update so the completed/cancelled frame is the last
-        # thing left on screen, then hand off to Live to restore the cursor.
+        # A final refresh so the completed/cancelled frame is the last thing left
+        # on screen, then hand off to Live to restore the cursor.
         try:
-            self._live.update(self._renderable())
+            self._live.refresh()
         finally:
             self._live.__exit__(exc_type, exc, tb)
 
