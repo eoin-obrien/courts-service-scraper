@@ -24,6 +24,21 @@ def test_citation_slug(citation, expected):
     assert citation_slug(citation) == expected
 
 
+@pytest.mark.parametrize(
+    ("citation", "expected"),
+    [
+        # Older judgments carry a lower-cased court token; the slug normalises it
+        # to upper case so they name canonically alongside their peers.
+        ("[2015] IEHc 168", "2015_IEHC_168"),
+        ("[2009] iehc 537", "2009_IEHC_537"),
+        ("[2013] IEHc 453", "2013_IEHC_453"),
+        ("[2014] iesc 12", "2014_IESC_12"),
+    ],
+)
+def test_citation_slug_normalises_case(citation, expected):
+    assert citation_slug(citation) == expected
+
+
 @pytest.mark.parametrize("bad", ["", "   ", None, "not a citation", "IESC 36"])
 def test_citation_slug_rejects_missing(bad):
     with pytest.raises(MissingCitationError):

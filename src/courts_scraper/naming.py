@@ -16,8 +16,13 @@ import unicodedata
 from collections.abc import Container
 from pathlib import Path
 
-# A neutral citation looks like: [2026] IESC 36 / [2019] IECA 112 / [2020] IEHC 5
-_CITATION_RE = re.compile(r"^\[(?P<year>\d{4})\]\s+(?P<code>IE[A-Z]+)\s+(?P<num>\d+)")
+# A neutral citation looks like: [2026] IESC 36 / [2019] IECA 112 / [2020] IEHC 5.
+# Matched case-insensitively: older judgments carry a lower-cased court token
+# (e.g. ``[2015] IEHc 168``, ``[2009] iehc 537``); the code is normalised to
+# upper case in the slug so those name canonically alongside their peers.
+_CITATION_RE = re.compile(
+    r"^\[(?P<year>\d{4})\]\s+(?P<code>IE[A-Za-z]+)\s+(?P<num>\d+)", re.IGNORECASE
+)
 
 # Characters we allow in a slug; everything else collapses to the separator.
 _SAFE_CHARS = re.compile(r"[^A-Za-z0-9]+")
@@ -67,7 +72,7 @@ def citation_slug(citation: str | None) -> str:
     if not match:
         raise MissingCitationError(f"unrecognised neutral citation: {citation!r}")
 
-    return f"{match['year']}_{match['code']}_{match['num']}"
+    return f"{match['year']}_{match['code'].upper()}_{match['num']}"
 
 
 def judge_slug(judge: str | None) -> str:
