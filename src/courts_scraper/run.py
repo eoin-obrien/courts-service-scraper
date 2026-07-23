@@ -24,11 +24,14 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
+import httpx
+
 from courts_scraper import __version__
 from courts_scraper.db import Repository
 from courts_scraper.download import (
     CancelToken,
     DownloadCancelled,
+    DownloadIncomplete,
     archive_superseded,
     download_pdf,
     download_to_scratch,
@@ -75,6 +78,42 @@ PHASE_LISTING = "listing"
 PHASE_METADATA = "metadata"
 PHASE_DOWNLOADS = "downloads"
 PHASE_REVALIDATE = "revalidate"
+
+
+class ViewPageUnavailable(RuntimeError):
+    """A view page came back with no metadata grid at all.
+
+    During a Courts Service outage the site stays up at the HTTP layer but
+    answers every view request with ``200`` and the generic *Judgments* shell
+    (no ``span.cell-title`` cells) instead of the judgment page. That parses to a
+    citation-less :class:`~courts_scraper.models.JudgmentMeta` and, untreated,
+    would be recorded as a terminal "no neutral citation" error for every row.
+    Raising this instead lets the outage breaker see the run of failures and
+    pause -- and leaves the rows ``pending`` so they resolve on a later resume.
+
+    An *empty* grid is the signal, not a *missing citation*: a real judgment page
+    that genuinely lacks a Neutral Citation still carries its other cells (Court,
+    Date, Judge, ...), so it keeps the normal no-citation skip path.
+    """
+
+
+#: Failures that count as a possible outage during a *download* (see
+#: :class:`~courts_scraper.recovery.OutageBreaker`). A ``DownloadIncomplete``
+#: means the server answered but the body was not a valid PDF -- as a one-off an
+#: isolated bad file (the breaker just defers it), but a *run* of them is the
+#: signature of a maintenance window serving a ``200`` holding page, which a bare
+#: :class:`httpx.HTTPError` set would miss entirely.
+_DOWNLOAD_OUTAGE_ERRORS: tuple[type[Exception], ...] = (
+    httpx.HTTPError,
+    DownloadIncomplete,
+)
+
+#: The same idea for the *metadata* phase: an empty view page (the outage shell)
+#: is an outage signal, not a per-row data problem, so it feeds the breaker.
+_METADATA_OUTAGE_ERRORS: tuple[type[Exception], ...] = (
+    httpx.HTTPError,
+    ViewPageUnavailable,
+)
 
 
 class ListingError(RuntimeError):
@@ -551,7 +590,9 @@ def run_metadata(
         return
 
     reporter.emit(PhaseStarted(PHASE_METADATA, len(pending)))
-    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    breaker = OutageBreaker(
+        fetcher, config.base_url, reporter, outage_errors=_METADATA_OUTAGE_ERRORS
+    )
     for row in pending:
         if cancel.cancelled:
             reporter.emit(Cancelled(PHASE_METADATA))
@@ -600,6 +641,12 @@ def _resolve_metadata(
     html = fetcher.get_text(row["view_url"])
     meta = parse_view_page(html, config.base_url)
 
+    # An empty metadata grid is the outage shell, not a real (citation-less)
+    # judgment page -- signal the breaker so a run of these pauses the crawl
+    # instead of terminally erroring every row (see ViewPageUnavailable).
+    if not meta.fields:
+        raise ViewPageUnavailable(row["view_url"])
+
     try:
         filename = pdf_filename(
             meta.neutral_citation, row["judge"], taken=repo.taken_filenames()
@@ -646,7 +693,9 @@ def run_downloads(
         reporter.emit(PhaseFinished(PHASE_DOWNLOADS, dict(repo.counts())))
         return
 
-    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    breaker = OutageBreaker(
+        fetcher, config.base_url, reporter, outage_errors=_DOWNLOAD_OUTAGE_ERRORS
+    )
     for row in pending:
         if cancel.cancelled:
             reporter.emit(Cancelled(PHASE_DOWNLOADS))
@@ -771,7 +820,9 @@ def revalidate_downloads(
         return 0
 
     before = repo.count_revisions()
-    breaker = OutageBreaker(fetcher, config.base_url, reporter)
+    breaker = OutageBreaker(
+        fetcher, config.base_url, reporter, outage_errors=_DOWNLOAD_OUTAGE_ERRORS
+    )
     for row in targets:
         if cancel.cancelled:
             reporter.emit(Cancelled(PHASE_REVALIDATE))
