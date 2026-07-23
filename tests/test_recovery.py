@@ -1,7 +1,12 @@
 import httpx
+import pytest
 
+from courts_scraper.download import DownloadIncomplete
 from courts_scraper.progress import QuietReporter
 from courts_scraper.recovery import OutageBreaker, Outcome
+
+# What the download/revalidate phases widen the breaker to (see run.py).
+_DOWNLOAD_ERRORS = (httpx.HTTPError, DownloadIncomplete)
 
 
 class _FakeFetcher:
@@ -31,6 +36,12 @@ class _FailThenSucceed:
 
 def _raise_timeout() -> None:
     raise httpx.ReadTimeout("down")
+
+
+def _raise_incomplete() -> None:
+    # What a 200 scheduled-maintenance page becomes: the body downloads fine at
+    # the HTTP layer but is not a PDF, so the integrity check rejects it.
+    raise DownloadIncomplete("https://x/a.pdf: response is not a PDF (missing %PDF-)")
 
 
 def _breaker(fetcher, sleeps, **kwargs) -> OutageBreaker:
@@ -76,6 +87,58 @@ def test_outage_pauses_probes_and_resumes():
     assert action.calls == 2  # failed once, retried once after recovery
     assert fetcher.probes == 2  # probed twice (up on the second)
     assert sleeps == [1.0, 2.0]  # escalating waits before each probe
+
+
+def test_body_incomplete_propagates_by_default():
+    # With the default outage set (httpx errors only), a body-integrity failure
+    # is the caller's concern and must propagate untouched -- never silently
+    # swallowed as an outage.
+    breaker = _breaker(_FakeFetcher(), [], threshold=3)
+    with pytest.raises(DownloadIncomplete):
+        breaker.run(_raise_incomplete)
+
+
+def test_maintenance_page_run_trips_the_outage_pause():
+    # Regression: a scheduled outage that serves HTTP 200 + a non-PDF holding
+    # page surfaces as a *run* of DownloadIncomplete. With the download phase's
+    # widened outage set, a run of them must trip the same pause an httpx outage
+    # does -- not race through failing every file on first attempt.
+    sleeps: list[float] = []
+    fetcher = _FakeFetcher(up_on_probe=1)  # server answers the probe again
+    breaker = _breaker(
+        fetcher,
+        sleeps,
+        threshold=3,
+        intervals=(1.0,),
+        max_outage=100.0,
+        outage_errors=_DOWNLOAD_ERRORS,
+    )
+
+    assert breaker.run(_raise_incomplete)[0] is Outcome.DEFER  # 1
+    assert breaker.run(_raise_incomplete)[0] is Outcome.DEFER  # 2
+    outcome, exc = breaker.run(_raise_incomplete)  # 3rd -> PAUSE -> probe
+
+    assert fetcher.probes == 1  # the breaker actually paused and probed
+    assert sleeps == [1.0]  # it waited before probing (real backoff)
+    # On "recovery" the same maintenance item is retried; it fails again but as
+    # an isolated (counter-reset) failure, so the crawl defers it and moves on.
+    assert outcome is Outcome.DEFER
+    assert isinstance(exc, DownloadIncomplete)
+
+
+def test_isolated_incomplete_defers_without_pausing():
+    # A single bad PDF among good ones is NOT an outage: it defers and the next
+    # success resets the counter, so it never trips the pause (no false alarm).
+    sleeps: list[float] = []
+    fetcher = _FakeFetcher()
+    breaker = _breaker(fetcher, sleeps, threshold=3, outage_errors=_DOWNLOAD_ERRORS)
+
+    assert breaker.run(_raise_incomplete)[0] is Outcome.DEFER  # consecutive = 1
+    assert breaker.run(lambda: None)[0] is Outcome.OK  # reset to 0
+    assert breaker.run(_raise_incomplete)[0] is Outcome.DEFER  # 1 again, no pause
+
+    assert fetcher.probes == 0  # never paused
+    assert sleeps == []  # never waited
 
 
 def test_gives_up_after_outage_cap():

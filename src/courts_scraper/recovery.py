@@ -11,6 +11,18 @@ defers it and moves on). At the threshold, the site is assumed down: the crawl
 pauses, re-probes on an escalating interval until the server responds, then
 retries the same item. If the outage outlasts a cap, it gives up so the run can
 be resumed later rather than hanging forever.
+
+A failure counts toward the breaker when it is one of ``outage_errors``. That
+defaults to :class:`httpx.HTTPError` (connection failures, timeouts, dropped
+sockets, 4xx/5xx), but the download/revalidate phases widen it to also include
+:class:`~courts_scraper.download.DownloadIncomplete`. That covers the outage
+flavour :class:`httpx.HTTPError` misses: a server that stays *up* at the HTTP
+layer during scheduled maintenance and answers every request with ``200`` and a
+non-PDF holding page. Without it, each such response is an isolated per-item
+error the breaker never sees, so the crawl races through every remaining file
+failing it on first attempt instead of pausing. Anything not in ``outage_errors``
+(an unsafe filename, a DB error) still propagates to the caller unchanged, so a
+genuine per-item bug is never mistaken for an outage.
 """
 
 from __future__ import annotations
@@ -60,16 +72,25 @@ class OutageBreaker:
         threshold: int = OUTAGE_THRESHOLD,
         intervals: tuple[float, ...] = PROBE_INTERVALS,
         max_outage: float = MAX_OUTAGE_SECONDS,
+        outage_errors: tuple[type[Exception], ...] = (httpx.HTTPError,),
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Configure the breaker (clock/sleep injectable for tests)."""
+        """Configure the breaker (clock/sleep injectable for tests).
+
+        ``outage_errors`` are the exception types a failed ``action`` raises that
+        should count toward the consecutive-failure tally; anything else
+        propagates to the caller. Defaults to :class:`httpx.HTTPError`; download
+        phases add :class:`~courts_scraper.download.DownloadIncomplete` so a run of
+        ``200`` maintenance-page responses trips the same pause.
+        """
         self._fetcher = fetcher
         self._probe_url = probe_url
         self._reporter = reporter
         self._threshold = threshold
         self._intervals = intervals
         self._max_outage = max_outage
+        self._outage_errors = outage_errors
         self._sleep = sleep
         self._monotonic = monotonic
         self._consecutive = 0
@@ -77,8 +98,9 @@ class OutageBreaker:
     def run(self, action: Callable[[], None]) -> tuple[Outcome, Exception | None]:
         """Run ``action`` with outage handling.
 
-        Non-HTTP exceptions (parse errors, cancellation) propagate to the caller;
-        only :class:`httpx.HTTPError` feeds the outage logic.
+        Exceptions outside ``outage_errors`` (parse errors, cancellation, an
+        unsafe filename) propagate to the caller; only an ``outage_errors``
+        failure feeds the outage logic.
 
         Returns:
             ``(OK, None)`` on success; ``(DEFER, exc)`` for an isolated failure;
@@ -87,7 +109,7 @@ class OutageBreaker:
         while True:
             try:
                 action()
-            except httpx.HTTPError as exc:
+            except self._outage_errors as exc:
                 self._consecutive += 1
                 if self._consecutive < self._threshold:
                     return Outcome.DEFER, exc
